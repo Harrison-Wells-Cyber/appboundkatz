@@ -51,7 +51,7 @@ const MAX_SLOTS: usize = 4;
 /// elevation service that hands over the wrapped key), so a short per-event
 /// wait would abandon the capture right before the decryption happens. A
 /// generous window with a hard deadline keeps us listening until the hit.
-const CAPTURE_WINDOW: Duration = Duration::from_secs(20);
+const CAPTURE_WINDOW: Duration = Duration::from_secs(30);
 
 /// On x64, Get/SetThreadContext require the CONTEXT buffer to be 16-byte
 /// aligned (the C header uses __declspec(align(16)), which the windows crate

@@ -11,8 +11,9 @@ use windows::Win32::System::Diagnostics::ToolHelp::{
 };
 use windows::Win32::System::LibraryLoader::{GetModuleHandleW, GetProcAddress};
 use windows::Win32::System::Threading::{
-    CreateProcessW, GetExitCodeProcess, OpenProcess, TerminateProcess, PROCESS_INFORMATION,
-    PROCESS_QUERY_INFORMATION, PROCESS_TERMINATE, PROCESS_VM_READ, STARTUPINFOW, CREATE_SUSPENDED,
+    CreateProcessW, GetExitCodeProcess, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
+    TerminateProcess, PROCESS_INFORMATION, PROCESS_QUERY_INFORMATION, PROCESS_TERMINATE,
+    PROCESS_VM_READ, STARTUPINFOW, CREATE_SUSPENDED,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     EnumWindows, GetWindowThreadProcessId, SetWindowPos, SWP_NOACTIVATE, SWP_NOSIZE, SWP_NOZORDER,
@@ -236,16 +237,19 @@ unsafe extern "system" fn collect_windows_of_pid(hwnd: HWND, lparam: LPARAM) -> 
 }
 
 /// Keep moving every top-level window of the given process to an off-screen
-/// spot for the requested duration. Runs on a background thread and returns
-/// immediately.
-pub fn park_windows_offscreen(pid: u32, run_for: Duration) {
+/// spot until the process is gone (bounded by a safety cap). Runs on a
+/// background thread and returns immediately.
+pub fn park_windows_offscreen(pid: u32) {
     std::thread::spawn(move || {
-        let deadline = Instant::now() + run_for;
         let mut collector = WindowCollector {
             pid,
             windows: Vec::new(),
         };
-        while Instant::now() < deadline {
+        let started = Instant::now();
+        loop {
+            if started.elapsed() > Duration::from_secs(120) || !process_alive(pid) {
+                break;
+            }
             collector.windows.clear();
             unsafe {
                 if EnumWindows(
@@ -270,4 +274,17 @@ pub fn park_windows_offscreen(pid: u32, run_for: Duration) {
             std::thread::sleep(Duration::from_millis(500));
         }
     });
+}
+
+fn process_alive(pid: u32) -> bool {
+    match unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid) } {
+        Ok(h) => {
+            let mut code = 0u32;
+            let alive = unsafe { GetExitCodeProcess(h, &mut code) }.is_ok()
+                && code == STILL_ACTIVE.0 as u32;
+            unsafe { let _ = CloseHandle(h); };
+            alive
+        }
+        Err(_) => false,
+    }
 }
