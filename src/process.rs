@@ -8,7 +8,6 @@ use windows::Win32::Foundation::{
 };
 use windows::Win32::System::Diagnostics::ToolHelp::{
     CreateToolhelp32Snapshot, Process32FirstW, Process32NextW, PROCESSENTRY32W, TH32CS_SNAPPROCESS,
-    TH32CS_SNAPTHREAD, Thread32First, Thread32Next, THREADENTRY32,
 };
 use windows::Win32::System::LibraryLoader::{GetModuleHandleW, GetProcAddress};
 use windows::Win32::System::Threading::{
@@ -74,31 +73,6 @@ pub fn terminate_matching(exe_name: &str) {
 pub fn is_alive(h: HANDLE) -> bool {
     let mut code = 0u32;
     unsafe { GetExitCodeProcess(h, &mut code) }.is_ok() && code == STILL_ACTIVE.0 as u32
-}
-
-pub fn threads_of(pid: u32) -> Vec<u32> {
-    let mut tids = Vec::new();
-    let Ok(snapshot) = (unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0) }) else {
-        return tids;
-    };
-
-    let mut entry = THREADENTRY32 {
-        dwSize: size_of::<THREADENTRY32>() as u32,
-        ..Default::default()
-    };
-
-    if unsafe { Thread32First(snapshot, &mut entry) }.is_ok() {
-        loop {
-            if entry.th32OwnerProcessID == pid {
-                tids.push(entry.th32ThreadID);
-            }
-            if unsafe { Thread32Next(snapshot, &mut entry) }.is_err() {
-                break;
-            }
-        }
-    }
-    unsafe { let _ = CloseHandle(snapshot); };
-    tids
 }
 
 fn snapshot_processes() -> Option<windows::Win32::Foundation::HANDLE> {
