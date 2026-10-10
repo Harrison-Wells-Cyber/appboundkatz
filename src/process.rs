@@ -98,6 +98,47 @@ pub fn ensure_no_instances(exe_name: &str, exclude_pid: Option<u32>) {
     }
 }
 
+/// Kill every bare (main-process-shaped) browser instance competing for the
+/// profile's process singleton: same executable name, not our own main
+/// process, and no "--type=" switch (the browser's child processes all carry
+/// one and must never be touched). This takes out prelaunched copies Edge
+/// respawns behind our back while we capture.
+pub fn kill_singleton_competitors(exe_name: &str, exclude_pid: u32) -> usize {
+    let mut killed = 0;
+    for pid in processes_with_name(exe_name) {
+        if pid == exclude_pid {
+            continue;
+        }
+        let Ok(h) = (unsafe { OpenProcess(PROCESS_QUERY_INFORMATION | PROCESS_VM_READ | PROCESS_TERMINATE, false, pid) })
+        else { continue };
+        let is_child = command_line_of(h).is_some_and(|c| c.contains("--type="));
+        if is_child {
+            unsafe { let _ = CloseHandle(h); };
+            continue;
+        }
+        if unsafe { TerminateProcess(h, 0) }.is_ok() {
+            crate::log_out!("[+] Killed prelaunched {exe_name} competitor, PID {pid}");
+            killed += 1;
+        }
+        unsafe { let _ = CloseHandle(h); };
+    }
+    killed
+}
+
+/// Keep reaping singleton competitors on a background thread for a short
+/// window early in the capture, while the spawned browser claims the
+/// profile's process singleton.
+pub fn spawn_competitor_reaper(exe_name: &str, exclude_pid: u32, run_for: Duration) {
+    let exe = exe_name.to_string();
+    std::thread::spawn(move || {
+        let deadline = Instant::now() + run_for;
+        while Instant::now() < deadline {
+            kill_singleton_competitors(&exe, exclude_pid);
+            std::thread::sleep(Duration::from_millis(500));
+        }
+    });
+}
+
 pub fn is_alive(h: HANDLE) -> bool {
     let mut code = 0u32;
     unsafe { GetExitCodeProcess(h, &mut code) }.is_ok() && code == STILL_ACTIVE.0 as u32
