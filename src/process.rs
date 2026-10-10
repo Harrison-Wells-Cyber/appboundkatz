@@ -49,10 +49,14 @@ pub fn spawn_suspended(exe: &str) -> Result<PROCESS_INFORMATION, String> {
     }
 }
 
-/// Kill every process of the given executable name. Only ever touches
-/// processes owned by the current user: no elevation is used or needed.
-pub fn terminate_matching(exe_name: &str) {
+/// Kill every process of the given executable name except `exclude_pid`.
+/// Only ever touches processes owned by the current user: no elevation is
+/// used or needed.
+pub fn terminate_matching(exe_name: &str, exclude_pid: Option<u32>) {
     for pid in processes_with_name(exe_name) {
+        if Some(pid) == exclude_pid {
+            continue;
+        }
         match unsafe {
             OpenProcess(
                 PROCESS_TERMINATE | PROCESS_QUERY_INFORMATION | PROCESS_VM_READ,
@@ -71,18 +75,25 @@ pub fn terminate_matching(exe_name: &str) {
     }
 }
 
-/// Kill existing instances of the given executable until none remain. Edge
+/// Kill existing instances of the given executable until none remain
+/// (skipping `exclude_pid`, e.g. our own suspended browser). Edge
 /// prelaunches background copies, so a single kill pass can race with one
 /// spawning between our kill and the browser start we are about to do.
-pub fn ensure_no_instances(exe_name: &str) {
+pub fn ensure_no_instances(exe_name: &str, exclude_pid: Option<u32>) {
     for _ in 0..3 {
-        if processes_with_name(exe_name).is_empty() {
+        if processes_with_name(exe_name)
+            .into_iter()
+            .all(|p| Some(p) == exclude_pid)
+        {
             return;
         }
-        terminate_matching(exe_name);
+        terminate_matching(exe_name, exclude_pid);
         std::thread::sleep(Duration::from_millis(300));
     }
-    if !processes_with_name(exe_name).is_empty() {
+    let left = processes_with_name(exe_name)
+        .into_iter()
+        .any(|p| Some(p) != exclude_pid);
+    if left {
         crate::log_err!("[-] Could not fully terminate {exe_name} instances; the capture may race a running browser");
     }
 }

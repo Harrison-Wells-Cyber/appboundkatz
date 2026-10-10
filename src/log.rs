@@ -6,9 +6,23 @@ use std::sync::{Mutex, OnceLock};
 /// working directory, so run output survives a closing console window.
 static LOG_FILE: OnceLock<Option<Mutex<File>>> = OnceLock::new();
 
+/// One timestamped log per run, so a failing run's diagnostics survive the
+/// next successful one that would otherwise overwrite appbound.log.
+fn log_path() -> String {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default();
+    let micros = 11_644_473_600_000_000 + now.as_secs() * 1_000_000;
+    let digits: String = crate::report::format_chromium_time(micros as i64)
+        .chars()
+        .filter(|c| c.is_ascii_digit())
+        .collect();
+    format!("appbound_{digits}.log")
+}
+
 fn log_file() -> Option<&'static Mutex<File>> {
     LOG_FILE
-        .get_or_init(|| File::create("appbound.log").ok().map(Mutex::new))
+        .get_or_init(|| File::create(log_path()).ok().map(Mutex::new))
         .as_ref()
 }
 

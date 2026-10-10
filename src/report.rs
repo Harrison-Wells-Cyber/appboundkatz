@@ -64,6 +64,7 @@ fn build_cookies_csv(cookies: &[CookieRow]) -> Result<Vec<u8>, String> {
     writer
         .write_record([
             "browser",
+            "url",
             "domain",
             "name",
             "path",
@@ -80,6 +81,7 @@ fn build_cookies_csv(cookies: &[CookieRow]) -> Result<Vec<u8>, String> {
         writer
             .write_record([
                 cookie.browser,
+                &full_cookie_url(cookie),
                 &cookie.host,
                 &cookie.name,
                 &cookie.path,
@@ -96,8 +98,16 @@ fn build_cookies_csv(cookies: &[CookieRow]) -> Result<Vec<u8>, String> {
     writer.into_inner().map_err(|e| e.to_string())
 }
 
+/// Cookies are stored per (domain, path), not per URL; reconstruct a usable
+/// URL from the stored fields.
+fn full_cookie_url(cookie: &CookieRow) -> String {
+    let scheme = if cookie.secure { "https" } else { "http" };
+    let host = cookie.host.trim_start_matches('.');
+    format!("{scheme}://{host}{}", cookie.path)
+}
+
 /// Chrome/Edge store timestamps as microseconds since 1601-01-01 (0 = "never").
-fn format_chromium_time(micros: i64) -> String {
+pub(crate) fn format_chromium_time(micros: i64) -> String {
     if micros == 0 {
         return "never".to_string();
     }

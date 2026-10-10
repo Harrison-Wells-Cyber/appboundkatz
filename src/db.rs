@@ -141,9 +141,14 @@ fn open_image(image: &[u8]) -> Option<Connection> {
 }
 
 fn text(row: &rusqlite::Row<'_>, index: usize) -> String {
-    row.get::<_, Vec<u8>>(index)
-        .map(|bytes| String::from_utf8_lossy(&bytes).to_string())
-        .unwrap_or_default()
+    // Bytes of TEXT or BLOB values; rusqlite's get::<Vec<u8>> rejects TEXT.
+    match row.get_ref(index) {
+        Ok(value) => match value.as_bytes() {
+            Ok(bytes) => String::from_utf8_lossy(bytes).to_string(),
+            Err(_) => String::new(),
+        },
+        Err(_) => String::new(),
+    }
 }
 
 /// A plausible key harvested at the breakpoint, tagged with where it came from.

