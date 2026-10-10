@@ -70,9 +70,35 @@ pub fn terminate_matching(exe_name: &str) {
     }
 }
 
+/// Kill existing instances of the given executable until none remain. Edge
+/// prelaunches background copies, so a single kill pass can race with one
+/// spawning between our kill and the browser start we are about to do.
+pub fn ensure_no_instances(exe_name: &str) {
+    for _ in 0..3 {
+        if processes_with_name(exe_name).is_empty() {
+            return;
+        }
+        terminate_matching(exe_name);
+        std::thread::sleep(Duration::from_millis(300));
+    }
+    if !processes_with_name(exe_name).is_empty() {
+        crate::log_err!("[-] Could not fully terminate {exe_name} instances; the capture may race a running browser");
+    }
+}
+
 pub fn is_alive(h: HANDLE) -> bool {
     let mut code = 0u32;
     unsafe { GetExitCodeProcess(h, &mut code) }.is_ok() && code == STILL_ACTIVE.0 as u32
+}
+
+/// Best-effort exit code of a finished process, for diagnostics.
+pub fn exit_code_of(h: HANDLE) -> u32 {
+    let mut code = 0u32;
+    if unsafe { GetExitCodeProcess(h, &mut code) }.is_ok() {
+        code
+    } else {
+        0
+    }
 }
 
 fn snapshot_processes() -> Option<windows::Win32::Foundation::HANDLE> {

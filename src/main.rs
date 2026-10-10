@@ -107,7 +107,7 @@ fn process_browser(spec: &BrowserSpec) -> Option<(Vec<LoginRow>, Vec<CookieRow>)
 
     // A running instance would make the new process hand off its work and exit
     // before we can trap the decryption, so always start from a clean slate.
-    process::terminate_matching(file_name(spec.exe));
+    process::ensure_no_instances(file_name(spec.exe));
 
     let pi = match process::spawn_suspended(spec.exe) {
         Ok(pi) => pi,
@@ -219,8 +219,9 @@ fn gather_profile_databases(
         }
         if !process::is_alive(main_process) {
             crate::log_err!(
-                "[-] The {} process exited while waiting for the profile databases",
-                spec.name
+                "[-] The {} process exited (code {:#x}) while waiting for the profile databases",
+                spec.name,
+                process::exit_code_of(main_process)
             );
             break;
         }

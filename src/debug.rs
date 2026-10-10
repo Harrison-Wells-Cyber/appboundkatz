@@ -327,6 +327,11 @@ pub fn run(hprocess: HANDLE, pid: u32, target_module: &str) -> Vec<KeyCandidate>
 
                     if fired.len() >= slots.len() {
                         arm_on_debuggee_threads(hprocess, &[]);
+                        // The current debug event must be continued before
+                        // detaching, or the frozen thread surfaces its
+                        // unconsumed single-step as an unhandled exception
+                        // once no debugger is attached anymore.
+                        unsafe { let _ = ContinueDebugEvent(ev_pid, tid, DBG_CONTINUE); };
                         break;
                     }
                     unsafe { let _ = ContinueDebugEvent(ev_pid, tid, DBG_CONTINUE); };
@@ -378,9 +383,13 @@ pub fn run(hprocess: HANDLE, pid: u32, target_module: &str) -> Vec<KeyCandidate>
                 }
             }
             EXIT_PROCESS_DEBUG_EVENT => {
-                crate::log_out!("[+] The debuggee exited");
+                if ev_pid == pid {
+                    crate::log_out!("[+] The main debuggee (pid {ev_pid}) exited");
+                    unsafe { let _ = ContinueDebugEvent(ev_pid, tid, DBG_CONTINUE); };
+                    break;
+                }
+                // A child process exited; keep watching the main debuggee.
                 unsafe { let _ = ContinueDebugEvent(ev_pid, tid, DBG_CONTINUE); };
-                break;
             }
             _ => {}
         }
