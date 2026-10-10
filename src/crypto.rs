@@ -7,6 +7,10 @@ const V20_PREFIX: &[u8] = b"v20";
 const GCM_IV_LENGTH: usize = 12;
 const GCM_TAG_LENGTH: usize = 16;
 
+pub fn to_hex(bytes: &[u8]) -> String {
+    bytes.iter().map(|b| format!("{b:02X}")).collect()
+}
+
 pub fn decrypt_v20(key: &[u8; 32], blob: &[u8]) -> Result<Vec<u8>, String> {
     let overhead = V20_PREFIX.len() + GCM_IV_LENGTH + GCM_TAG_LENGTH;
     if blob.len() < overhead || &blob[..V20_PREFIX.len()] != V20_PREFIX {

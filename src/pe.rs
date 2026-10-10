@@ -77,26 +77,34 @@ pub fn find_pattern(h: HANDLE, base: usize, needle: &[u8]) -> Option<usize> {
 /// 8D  = LEA
 /// 0D  = ModRM (Mod=00, Reg=001 -> RCX, R/M=101 -> RIP-relative)
 /// ..  = disp32, resolved at runtime: instruction VA + 7 + disp
-pub fn find_lea_xref(h: HANDLE, base: usize, target: usize) -> Option<usize> {
+pub fn find_lea_xrefs(h: HANDLE, base: usize, target: usize) -> Vec<usize> {
     const INSTR_LEN: usize = 7;
-    let section = find_section(h, base, ".text")?;
-    let data = read_section(h, base, &section)?;
+    let Some(section) = find_section(h, base, ".text") else {
+        crate::log_err!("[-] Failed to get .text section header.");
+        return Vec::new();
+    };
+    let Some(data) = read_section(h, base, &section) else {
+        crate::log_err!("[-] Failed to read the .text section.");
+        return Vec::new();
+    };
     if data.len() < INSTR_LEN {
-        return None;
+        return Vec::new();
     }
     let section_base = base + section.virtual_address as usize;
 
+    let mut hits = Vec::new();
     for i in 0..=(data.len() - INSTR_LEN) {
         if data[i] != 0x48 || data[i + 1] != 0x8D || data[i + 2] != 0x0D {
             continue;
         }
-        let disp = i32::from_le_bytes(data[i + 3..i + 7].try_into().ok()?);
+        let Ok(disp_bytes) = data[i + 3..i + 7].try_into() else { continue };
+        let disp = i32::from_le_bytes(disp_bytes);
         let instruction_va = section_base + i;
         let effective = instruction_va.wrapping_add(INSTR_LEN).wrapping_add(disp as usize);
         if effective == target {
-            println!("[+] Found LEA RCX xref at {instruction_va:#x}");
-            return Some(instruction_va);
+            crate::log_out!("[+] Found LEA RCX xref at {instruction_va:#x}");
+            hits.push(instruction_va);
         }
     }
-    None
+    hits
 }

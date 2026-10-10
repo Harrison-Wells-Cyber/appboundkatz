@@ -61,11 +61,11 @@ pub fn terminate_matching(exe_name: &str) {
         } {
             Ok(h) => {
                 if unsafe { TerminateProcess(h, 0) }.is_ok() {
-                    println!("[+] Terminated existing {exe_name} instance, PID {pid}");
+                    crate::log_out!("[+] Terminated existing {exe_name} instance, PID {pid}");
                 }
                 unsafe { let _ = CloseHandle(h); };
             }
-            Err(e) => eprintln!("[-] OpenProcess({pid}) failed: {e}"),
+            Err(e) => crate::log_err!("[-] OpenProcess({pid}) failed: {e}"),
         }
     }
 }

