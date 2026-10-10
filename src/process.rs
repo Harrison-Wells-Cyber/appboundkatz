@@ -1,15 +1,13 @@
-use std::mem::{size_of, transmute};
-use std::sync::OnceLock;
+use std::mem::size_of;
 use std::time::{Duration, Instant};
 
-use windows::core::{s, w, HSTRING, PCWSTR, PWSTR};
+use windows::core::{HSTRING, PCWSTR, PWSTR};
 use windows::Win32::Foundation::{
     CloseHandle, BOOL, HANDLE, HWND, INVALID_HANDLE_VALUE, LPARAM, STILL_ACTIVE,
 };
 use windows::Win32::System::Diagnostics::ToolHelp::{
     CreateToolhelp32Snapshot, Process32FirstW, Process32NextW, PROCESSENTRY32W, TH32CS_SNAPPROCESS,
 };
-use windows::Win32::System::LibraryLoader::{GetModuleHandleW, GetProcAddress};
 use windows::Win32::System::Threading::{
     CreateProcessW, GetExitCodeProcess, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
     TerminateProcess, PROCESS_INFORMATION, PROCESS_QUERY_INFORMATION, PROCESS_TERMINATE,
@@ -105,19 +103,34 @@ pub fn ensure_no_instances(exe_name: &str, exclude_pid: Option<u32>) {
 /// respawns behind our back while we capture.
 pub fn kill_singleton_competitors(exe_name: &str, exclude_pid: u32) -> usize {
     let mut killed = 0;
-    for pid in processes_with_name(exe_name) {
-        if pid == exclude_pid {
+    for proc_info in processes_named(exe_name) {
+        if proc_info.pid == exclude_pid {
             continue;
         }
-        let Ok(h) = (unsafe { OpenProcess(PROCESS_QUERY_INFORMATION | PROCESS_VM_READ | PROCESS_TERMINATE, false, pid) })
-        else { continue };
-        let is_child = command_line_of(h).is_some_and(|c| c.contains("--type="));
+        let Ok(h) = (
+            unsafe { OpenProcess(PROCESS_QUERY_INFORMATION | PROCESS_VM_READ | PROCESS_TERMINATE, false, proc_info.pid) }
+        ) else { continue };
+        let (is_child, command_line) = match command_line_of(h) {
+            Some(c) => {
+                let child = c.contains("--type=");
+                (child, Some(c))
+            }
+            None => (false, None),
+        };
         if is_child {
             unsafe { let _ = CloseHandle(h); };
             continue;
         }
+        // Forensics: knowing who spawned the competitor and what it runs
+        // tells us whether we are racing Edge's own relaunch machinery.
+        crate::log_out!(
+            "[*] Competitor {} (parent {}): {}",
+            proc_info.pid,
+            proc_info.parent,
+            command_line.unwrap_or_else(|| "<no cmdline>".to_string())
+        );
         if unsafe { TerminateProcess(h, 0) }.is_ok() {
-            crate::log_out!("[+] Killed prelaunched {exe_name} competitor, PID {pid}");
+            crate::log_out!("[+] Killed prelaunched {exe_name} competitor, PID {}", proc_info.pid);
             killed += 1;
         }
         unsafe { let _ = CloseHandle(h); };
@@ -161,10 +174,15 @@ fn snapshot_processes() -> Option<windows::Win32::Foundation::HANDLE> {
     }
 }
 
-fn processes_with_name(exe_name: &str) -> Vec<u32> {
-    let mut pids = Vec::new();
+pub struct ProcInfo {
+    pub pid: u32,
+    pub parent: u32,
+}
+
+fn processes_named(exe_name: &str) -> Vec<ProcInfo> {
+    let mut out = Vec::new();
     let Some(snapshot) = snapshot_processes() else {
-        return pids;
+        return out;
     };
 
     let mut entry = PROCESSENTRY32W {
@@ -178,7 +196,10 @@ fn processes_with_name(exe_name: &str) -> Vec<u32> {
                 .trim_end_matches('\0')
                 .to_string();
             if name.eq_ignore_ascii_case(exe_name) {
-                pids.push(entry.th32ProcessID);
+                out.push(ProcInfo {
+                    pid: entry.th32ProcessID,
+                    parent: entry.th32ParentProcessID,
+                });
             }
             if unsafe { Process32NextW(snapshot, &mut entry) }.is_err() {
                 break;
@@ -186,11 +207,22 @@ fn processes_with_name(exe_name: &str) -> Vec<u32> {
         }
     }
     unsafe { let _ = CloseHandle(snapshot); };
-    pids
+    out
 }
 
-type NtQueryInformationProcessFn =
-    unsafe extern "system" fn(HANDLE, i32, *mut std::ffi::c_void, u32, *mut u32) -> i32;
+fn processes_with_name(exe_name: &str) -> Vec<u32> {
+    processes_named(exe_name).into_iter().map(|p| p.pid).collect()
+}
+
+extern "system" {
+    fn NtQueryInformationProcess(
+        h: HANDLE,
+        info_class: i32,
+        info: *mut std::ffi::c_void,
+        info_len: u32,
+        ret_len: *mut u32,
+    ) -> i32;
+}
 
 #[repr(C)]
 #[derive(Default)]
@@ -208,22 +240,11 @@ const PROCESS_BASIC_INFORMATION_CLASS: i32 = 0;
 const PEB_PROCESS_PARAMETERS_OFFSET: usize = 0x20;
 const PARAMS_COMMAND_LINE_OFFSET: usize = 0x70;
 
-fn nt_query_information_process() -> Option<NtQueryInformationProcessFn> {
-    static FN: OnceLock<Option<NtQueryInformationProcessFn>> = OnceLock::new();
-    *FN.get_or_init(|| unsafe {
-        let ntdll = GetModuleHandleW(w!("ntdll.dll")).ok()?;
-        let address = GetProcAddress(ntdll, s!("NtQueryInformationProcess"))?;
-        Some(transmute(address))
-    })
-}
-
 fn command_line_of(h: HANDLE) -> Option<String> {
-    let nt_query_information_process = nt_query_information_process()?;
-
     let mut info = ProcessBasicInformation::default();
     let mut return_length = 0u32;
     let status = unsafe {
-        nt_query_information_process(
+        NtQueryInformationProcess(
             h,
             PROCESS_BASIC_INFORMATION_CLASS,
             &mut info as *mut _ as *mut std::ffi::c_void,

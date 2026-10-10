@@ -114,6 +114,7 @@ fn process_browser(spec: &BrowserSpec) -> Option<(Vec<LoginRow>, Vec<CookieRow>)
     let mut outcome = debug::DebugOutcome {
         candidates: Vec::new(),
         saw_module: false,
+        main_exit_code: None,
     };
 
     // If the winning attempt is the second one, these hold that attempt's
@@ -185,12 +186,19 @@ fn process_browser(spec: &BrowserSpec) -> Option<(Vec<LoginRow>, Vec<CookieRow>)
         if !outcome.candidates.is_empty() || outcome.saw_module {
             break;
         }
-        // No module load at all: the process either handed off or died during
-        // startup. Tear everything down and try once more.
-        crate::log_out!(
-            "[*] The {} process exited before its module loaded; retrying",
-            spec.name
-        );
+        // No module load at all: the process handed off, died during startup,
+        // or never reached the module. Tear everything down and try again.
+        if let Some(code) = outcome.main_exit_code {
+            crate::log_out!(
+                "[*] The {} process (pid {}) exited before its module loaded (code {code:#x}); retrying",
+                spec.name, pi.dwProcessId
+            );
+        } else {
+            crate::log_out!(
+                "[*] The {} capture attempt ended without a module load; retrying",
+                spec.name
+            );
+        }
         cleanup(&pi);
         process::terminate_matching(file_name(spec.exe), None);
     }
