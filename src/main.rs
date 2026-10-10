@@ -37,16 +37,9 @@ fn file_name(path: &str) -> &str {
 }
 
 fn banner() {
-    println!("______ _                 _   _             _  __     _        ");
-    println!("|  ____| |               | | (_)           | |/ /    | |       ");
-    println!("| |__  | | _____   ____ _| |_ _  ___  _ __ | ' / __ _| |_ ____ ");
-    println!("|  __| | |/ _ \\ \\ / / _` | __| |/ _ \\| '_ \\|  < / _` | __|_  / ");
-    println!("| |____| |  __/\\ V / (_| | |_| | (_) | | | | . \\ (_| | |_ / /  ");
-    println!("|______|_| \\___| \\_/ \\__,_|\\__|_|\\___/|_| |_|_|\\_\\__,_|\\__/___| ");
-    println!("appboundkatz - educational Rust port of ElevationKatz by Meckazin");
-    println!("Captures the current user's Chrome/Edge App-Bound Encryption key and");
-    println!("dumps the default profile's saved passwords and cookies. No elevation:");
-    println!("only processes of the user running this tool are ever touched.\n");
+    println!("appbound v0.1.0");
+    println!("Captures the current user's browser App-Bound Encryption key and");
+    println!("exports the default profile's saved passwords and cookies.\n");
 }
 
 fn main() {
@@ -150,6 +143,8 @@ fn process_browser(spec: &BrowserSpec) -> Option<(Vec<LoginRow>, Vec<CookieRow>)
         None => {
             eprintln!("[-] Failed to capture the {} key", spec.name);
             cleanup(&pi);
+            // The browser may have already spawned children by now.
+            process::terminate_matching(file_name(spec.exe));
             return None;
         }
     };

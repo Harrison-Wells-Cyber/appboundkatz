@@ -1,5 +1,5 @@
 [package]
-name = "appboundkatz"
+name = "appbound"
 version = "0.1.0"
 edition = "2021"
 description = "Educational Rust port of ElevationKatz (ChromeKatz by Meckazin): captures the current user's Chrome/Edge App-Bound Encryption key via a debugger breakpoint and dumps the default profile's saved passwords and cookies to CSV, zipped."

