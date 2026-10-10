@@ -1,3 +1,7 @@
+Slop disclaimer, this README is SLOP. Don't trust it until I have a prod release lol.
+
+
+
 # appboundkatz
 
 An educational Rust port of [ElevationKatz](https://github.com/mkaliere/ChromeKatz)
