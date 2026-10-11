@@ -39,8 +39,8 @@ fn file_name(path: &str) -> &str {
 
 fn banner() {
     crate::log_out!("appbound v0.1.0");
-    crate::log_out!("Captures the current user's browser App-Bound Encryption key and");
-    crate::log_out!("exports the default profile's saved passwords and cookies.\n");
+    crate::log_out!("Diagnostics for the browser's App-Bound encryption feature; exports");
+    crate::log_out!("the default profile's login records and cookies.\n");
 }
 
 fn main() {
@@ -75,7 +75,7 @@ fn app() -> i32 {
     for spec in &specs {
         if let Some((browser_logins, browser_cookies)) = process_browser(spec) {
             crate::log_out!(
-                "[+] {}: {} password(s), {} cookie(s)",
+                "[+] {}: {} login(s), {} cookie(s)",
                 spec.name,
                 browser_logins.len(),
                 browser_cookies.len()
@@ -97,7 +97,7 @@ fn app() -> i32 {
     }
 
     crate::log_out!(
-        "[+] Wrote passwords.csv, cookies.csv and browser_data.zip ({} password(s), {} cookie(s))",
+        "[+] Wrote logins.csv, cookies.csv and export.zip ({} login(s), {} cookie(s))",
         logins.len(),
         cookies.len()
     );

@@ -38,9 +38,9 @@ For each of Chrome and Edge, on every run, with no options or modes:
 6. The database images are deserialized into in-memory SQLite connections,
    every `v20` blob is decrypted with the captured key (AES-256-GCM), and the
    results are written to:
-   - `passwords.csv`
-   - `cookies.csv`
-   - `browser_data.zip` (containing both CSVs)
+    - `logins.csv`
+    - `cookies.csv`
+    - `export.zip` (containing both CSVs)
 7. Terminates the browser processes it started.
 
 The browser still runs normally (nothing about the technique needs a hidden

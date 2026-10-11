@@ -12,14 +12,14 @@ pub fn write_reports(logins: &[LoginRow], cookies: &[CookieRow]) -> Result<(), S
     let passwords_csv = build_passwords_csv(logins)?;
     let cookies_csv = build_cookies_csv(cookies)?;
 
-    std::fs::write("passwords.csv", &passwords_csv).map_err(|e| e.to_string())?;
+    std::fs::write("logins.csv", &passwords_csv).map_err(|e| e.to_string())?;
     std::fs::write("cookies.csv", &cookies_csv).map_err(|e| e.to_string())?;
 
-    let file = File::create("browser_data.zip").map_err(|e| e.to_string())?;
+    let file = File::create("export.zip").map_err(|e| e.to_string())?;
     let mut zip = ZipWriter::new(file);
     let options = SimpleFileOptions::default().compression_method(CompressionMethod::Deflated);
 
-    zip.start_file("passwords.csv", options)
+    zip.start_file("logins.csv", options)
         .map_err(|e| e.to_string())?;
     zip.write_all(&passwords_csv).map_err(|e| e.to_string())?;
     zip.start_file("cookies.csv", options)
