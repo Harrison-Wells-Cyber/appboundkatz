@@ -1,15 +1,17 @@
-use std::mem::size_of;
+use std::mem::{size_of, transmute};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
-use windows::core::{HSTRING, PCWSTR, PWSTR};
+use windows::core::{s, w, HSTRING, PCWSTR, PWSTR};
 use windows::Win32::Foundation::{
     CloseHandle, BOOL, HANDLE, HWND, INVALID_HANDLE_VALUE, LPARAM, STILL_ACTIVE,
 };
 use windows::Win32::System::Diagnostics::ToolHelp::{
     CreateToolhelp32Snapshot, Process32FirstW, Process32NextW, PROCESSENTRY32W, TH32CS_SNAPPROCESS,
 };
+use windows::Win32::System::LibraryLoader::{GetModuleHandleW, GetProcAddress};
 use windows::Win32::System::Threading::{
     CreateProcessW, GetExitCodeProcess, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
     TerminateProcess, PROCESS_INFORMATION, PROCESS_QUERY_INFORMATION, PROCESS_TERMINATE,
@@ -198,15 +200,8 @@ fn processes_with_name(exe_name: &str) -> Vec<u32> {
     out
 }
 
-extern "system" {
-    fn NtQueryInformationProcess(
-        h: HANDLE,
-        info_class: i32,
-        info: *mut std::ffi::c_void,
-        info_len: u32,
-        ret_len: *mut u32,
-    ) -> i32;
-}
+type NtQueryInformationProcessFn =
+    unsafe extern "system" fn(HANDLE, i32, *mut std::ffi::c_void, u32, *mut u32) -> i32;
 
 #[repr(C)]
 #[derive(Default)]
@@ -224,11 +219,22 @@ const PROCESS_BASIC_INFORMATION_CLASS: i32 = 0;
 const PEB_PROCESS_PARAMETERS_OFFSET: usize = 0x20;
 const PARAMS_COMMAND_LINE_OFFSET: usize = 0x70;
 
+fn nt_query_information_process() -> Option<NtQueryInformationProcessFn> {
+    static FN: OnceLock<Option<NtQueryInformationProcessFn>> = OnceLock::new();
+    *FN.get_or_init(|| unsafe {
+        let ntdll = GetModuleHandleW(w!("ntdll.dll")).ok()?;
+        let address = GetProcAddress(ntdll, s!("NtQueryInformationProcess"))?;
+        Some(transmute(address))
+    })
+}
+
 fn command_line_of(h: HANDLE) -> Option<String> {
+    let nt_query_information_process = nt_query_information_process()?;
+
     let mut info = ProcessBasicInformation::default();
     let mut return_length = 0u32;
     let status = unsafe {
-        NtQueryInformationProcess(
+        nt_query_information_process(
             h,
             PROCESS_BASIC_INFORMATION_CLASS,
             &mut info as *mut _ as *mut std::ffi::c_void,
