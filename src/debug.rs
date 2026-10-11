@@ -239,7 +239,14 @@ pub struct DebugOutcome {
 /// for the browser to run through its own app-bound decryption. On every
 /// breakpoint hit, harvest key candidates from all registers; the true key is
 /// picked later by validating candidates against real encrypted blobs.
-pub fn run(hprocess: HANDLE, pid: u32, target_module: &str) -> DebugOutcome {
+/// `breakpoints_set` is flipped once the hardware breakpoints are armed so
+/// the caller can retire any startup-only helpers.
+pub fn run(
+    hprocess: HANDLE,
+    pid: u32,
+    target_module: &str,
+    breakpoints_set: &std::sync::atomic::AtomicBool,
+) -> DebugOutcome {
     let mut outcome = DebugOutcome {
         candidates: Vec::new(),
         saw_module: false,
@@ -378,6 +385,9 @@ pub fn run(hprocess: HANDLE, pid: u32, target_module: &str) -> DebugOutcome {
                                 "[*] Hardware breakpoints armed on {armed} threads at {} site(s)",
                                 slots.len()
                             );
+                            // The module is loaded and trapped; prelaunch
+                            // copies can no longer steal the singleton.
+                            breakpoints_set.store(true, std::sync::atomic::Ordering::Relaxed);
                         }
                     }
                 }
