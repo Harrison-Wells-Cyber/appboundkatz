@@ -1,18 +1,12 @@
-Slop disclaimer, this README is SLOP. Don't trust it until I have a prod release lol.
-
-
-
 # appboundkatz
 
-An educational Rust port of [ElevationKatz](https://github.com/mkaliere/ChromeKatz)
+A reliable, simple Rust port of [ElevationKatz](https://github.com/mkaliere/ChromeKatz)
 (by Meckazin / ChromeKatz) that demonstrates how Chrome's and Edge's
 **App-Bound Encryption (ABE)** can be defeated without ever touching the
 SYSTEM elevation service, COM interfaces, or any elevated privilege.
 
 The tool runs as a **standard, unelevated user** and only ever interacts with
 processes started by that same user.
-
-> For authorized research and lab use only (see the note at the bottom).
 
 ## What it does
 
@@ -41,10 +35,11 @@ For each of Chrome and Edge, on every run, with no options or modes:
     - `logins.csv`
     - `cookies.csv`
     - `export.zip` (containing both CSVs)
+   Only the default profile is dumped.
 7. Terminates the browser processes it started.
 
 The browser still runs normally (nothing about the technique needs a hidden
-process), but a background thread continuously parks its windows off-screen
+process), but a background thread attempts to continuously parks its windows off-screen
 (`-32000, -32000`) for the duration of the run, so it never occupies the
 desktop. The windows remain visible in the taskbar and Alt-Tab.
 
@@ -71,40 +66,11 @@ Cross-compile from Linux (mingw-w64):
 cargo build --release --target x86_64-pc-windows-gnu
 ```
 
-## Lab validation notes
-
-- Set up a Chrome/Edge profile with fake saved passwords and cookies, **let
-  the browser close cleanly** (so the SQLite WAL is checkpointed), then run the
-  tool.
-- Data written during a browser session that was killed without a clean
-  checkpoint may still live in the `-wal` file only, which the in-memory image
-  of the main database does not contain — same limitation as the original
-  tool.
-- Only the `User Data\Default` profile is dumped.
-- Assumes default install paths for Chrome (`C:\Program Files\Google\Chrome\
-  Application\chrome.exe`) and Edge (`C:\Program Files (x86)\Microsoft\Edge\
-  Application\msedge.exe`).
-
-## Defensive/detection notes
-
-- The tool is a debugger: a spawned browser gets a debug parent
-  (`DebugActiveProcess`), hardware breakpoints are set via debug registers,
-  and its memory is read with `ReadProcessMemory`.
-- The bypass works because the *legitimate browser process* decrypts the
-  app-bound key at startup — the tool only observes it. From the elevation
-  service's perspective, nothing abnormal happened.
-- Browser child processes being debugged by a non-standard parent is a
-  behavioral signal worth monitoring.
-
 ## Credits
 
 - Original technique and tool: **ElevationKatz** by Meckazin
   (github.com/Meckazin, ChromeKatz)
-- The banner ASCII art and the general approach are a respectful homage to
-  the original.
 
-## Legal
+## Ethics stuff
 
-Provided for education, defensive research, and authorized security testing
-only. Do not run this against profiles, machines, or users you are not
-explicitly authorized to test.
+I just gave you the guts for an infotealer. Please don't do crime against anyone who hasn't earned it :)
